@@ -22,6 +22,7 @@
     #define NAPI_EXTERN __declspec(dllexport)
   #else
     #define NAPI_EXTERN /* nothing */
+    #define NAPI_NO_RETURN
   #endif
 #endif
 
@@ -36,6 +37,29 @@
 #endif
 
 EXTERN_C_START
+
+typedef struct {
+  int nm_version;
+  unsigned int nm_flags;
+  const char* nm_filename;
+  void* nm_register_func;
+  const char* nm_modname;
+  void* nm_priv;
+  void* reserved[4];
+} napi_module;
+
+//TODO: stub
+NAPI_NO_RETURN void napi_fatal_error(const char* location,
+                                     size_t location_len,
+                                     const char* message,
+                                     size_t message_len);
+
+//TODO: stub
+NAPI_EXTERN napi_status napi_detach_arraybuffer(napi_env env,
+                                                napi_value arraybuffer);
+
+//TODO: stub
+NAPI_EXTERN void napi_module_register(napi_module* mod);
 
 NAPI_EXTERN napi_status
 napi_get_last_error_info(napi_env env,

@@ -48,17 +48,17 @@ typedef struct {
   void* reserved[4];
 } napi_module;
 
-//TODO: stub
+// TODO: remove
 NAPI_NO_RETURN void napi_fatal_error(const char* location,
                                      size_t location_len,
                                      const char* message,
                                      size_t message_len);
 
-//TODO: stub
+// TODO: remove
 NAPI_EXTERN napi_status napi_detach_arraybuffer(napi_env env,
                                                 napi_value arraybuffer);
 
-//TODO: stub
+// TODO: remove
 NAPI_EXTERN void napi_module_register(napi_module* mod);
 
 NAPI_EXTERN napi_status

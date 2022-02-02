@@ -22,8 +22,8 @@
     #define NAPI_EXTERN __declspec(dllexport)
   #else
     #define NAPI_EXTERN /* nothing */
-    #define NAPI_NO_RETURN
   #endif
+  #define NAPI_NO_RETURN
 #endif
 
 #define NAPI_AUTO_LENGTH SIZE_MAX

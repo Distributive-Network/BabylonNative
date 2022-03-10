@@ -22,9 +22,9 @@ namespace Babylon
 
     void WorkQueue::Suspend()
     {
-        auto suspensionMutex = std::make_unique<std::mutex>();
+        auto suspensionMutex = std::make_shared<std::mutex>();
         m_suspensionLock.emplace(*suspensionMutex);
-        Append([suspensionMutex{std::move(suspensionMutex)}](Napi::Env) mutable {
+        Append([suspensionMutex{std::move(suspensionMutex)}](Napi::Env) {
             std::scoped_lock lock{*suspensionMutex};
         });
     }
@@ -45,6 +45,5 @@ namespace Babylon
         }
 
         m_dispatcher.clear();
-        m_task = arcana::task_from_result<std::exception_ptr>();
     }
 }

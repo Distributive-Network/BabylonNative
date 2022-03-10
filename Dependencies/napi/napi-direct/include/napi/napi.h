@@ -1013,6 +1013,7 @@ namespace Napi {
     Value Call(size_t argc, const napi_value* args) const;
     Value Call(napi_value recv, const std::initializer_list<napi_value>& args) const;
     Value Call(napi_value recv, const std::vector<napi_value>& args) const;
+    Value Call(napi_value recv, size_t argc, const Napi::Value* args) const;
     Value Call(napi_value recv, size_t argc, const napi_value* args) const;
 
 #ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
@@ -1324,6 +1325,11 @@ namespace Napi {
     static Error New(napi_env env);
     static Error New(napi_env env, const char* message);
     static Error New(napi_env env, const std::string& message);
+
+#ifdef NAPI_CPP_EXCEPTIONS
+    static Error New(napi_env env, const std::exception& exception);
+    static Error New(napi_env env, const std::exception_ptr& exception_ptr);
+#endif // NAPI_CPP_EXCEPTIONS
 
     static NAPI_NO_RETURN void Fatal(const char* location, const char* message);
 

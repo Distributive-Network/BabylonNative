@@ -19,7 +19,7 @@ namespace Babylon
         }
 
         auto jsNative = Napi::Object::New(env);
-        global.Set(JS_NATIVE_NAME, jsNative);
+        env.Global().Set(NativeObject::JS_NATIVE_NAME, jsNative);
 
         Napi::Value jsRuntime = Napi::External<JsRuntime>::New(env, this, [](Napi::Env, JsRuntime* runtime) { delete runtime; });
         jsNative.Set(JS_RUNTIME_NAME, jsRuntime);
@@ -33,8 +33,7 @@ namespace Babylon
 
     JsRuntime& JsRuntime::GetFromJavaScript(Napi::Env env)
     {
-        return *env.Global()
-                    .Get(JS_NATIVE_NAME)
+        return *NativeObject::GetFromJavaScript(env)
                     .As<Napi::Object>()
                     .Get(JS_RUNTIME_NAME)
                     .As<Napi::External<JsRuntime>>()
@@ -44,6 +43,17 @@ namespace Babylon
     void JsRuntime::Dispatch(std::function<void(Napi::Env)> function)
     {
         std::scoped_lock lock{m_mutex};
-        m_dispatchFunction(std::move(function));
+        m_dispatchFunction([function = std::move(function)](Napi::Env env) {
+            function(env);
+
+            // The environment will be in a pending exceptional state if
+            // Napi::Error::ThrowAsJavaScriptException is invoked within the
+            // previous function. Throw and clear the pending exception here to
+            // bubble up the exception to the the dispatcher.
+            if (env.IsExceptionPending())
+            {
+                throw env.GetAndClearPendingException();
+            }
+        });
     }
 }

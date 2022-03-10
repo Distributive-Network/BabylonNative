@@ -1,7 +1,10 @@
 #pragma once
 
-#include <Shared/InputManager.h>
+#include <Babylon/Plugins/NativeInput.h>
 #include <Babylon/AppRuntime.h>
+#include <Babylon/Graphics.h>
+#include <Babylon/Plugins/ChromeDevTools.h>
+#include <Babylon/Polyfills/Canvas.h>
 
 // Main entry point for our app. Connects the app with the Windows shell and handles application lifecycle events.
 ref class App sealed : public Windows::ApplicationModel::Core::IFrameworkView
@@ -38,8 +41,12 @@ private:
 
     void RestartRuntime(Windows::Foundation::Rect bounds);
 
+    std::unique_ptr<Babylon::Graphics> m_graphics{};
+    std::unique_ptr<Babylon::Graphics::Update> m_update{};
     std::unique_ptr<Babylon::AppRuntime> m_runtime{};
-    std::unique_ptr<InputManager::InputBuffer> m_inputBuffer{};
+    Babylon::Plugins::NativeInput* m_nativeInput{};
+    std::unique_ptr<Babylon::Plugins::ChromeDevTools> m_chromeDevTools{};
+    std::unique_ptr<Babylon::Polyfills::Canvas> m_nativeCanvas{};
     Windows::Foundation::Collections::IVectorView<Windows::Storage::IStorageItem^>^ m_files;
     bool m_windowClosed;
     bool m_windowVisible;

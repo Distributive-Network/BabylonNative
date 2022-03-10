@@ -1,210 +1,73 @@
 #include "NativeEngine.h"
-#include <spirv_cross.hpp>
-#include <spirv_parser.hpp>
 #include "ShaderCompiler.h"
+#include "Texture.h"
+#include "JsConsoleLogger.h"
+
 #include <arcana/threading/task.h>
 #include <arcana/threading/task_schedulers.h>
+#include <arcana/macros.h>
+#include <arcana/tracing/trace_region.h>
 
 #include <napi/env.h>
+#include <napi/napi_pointer.h>
 
 #include <bgfx/bgfx.h>
-#include <bgfx/platform.h>
-
-// TODO: this needs to be fixed in bgfx
-namespace bgfx
-{
-    uint16_t attribToId(Attrib::Enum _attr);
-}
-
-#define BGFX_UNIFORM_FRAGMENTBIT UINT8_C(0x10) // Copy-pasta from bgfx_p.h
-#define BGFX_UNIFORM_SAMPLERBIT UINT8_C(0x20)  // Copy-pasta from bgfx_p.h
-#define BGFX_RESET_FLAGS (BGFX_RESET_VSYNC | BGFX_RESET_MSAA_X4 | BGFX_RESET_MAXANISOTROPY)
 
 #include <bimg/bimg.h>
 #include <bimg/decode.h>
 #include <bimg/encode.h>
 
+// STB_IMAGE_RESIZE_IMPLEMENTATION will define implementation in stb_image_resize.h. Many .cpp can include it 
+// but only one can define implementation or linking errors will popup.
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include <stb/stb_image_resize.h>
 #include <bx/math.h>
-
-#include <queue>
-#include <regex>
-#include <sstream>
-#include <variant>
 
 namespace Babylon
 {
     namespace
     {
-        template<typename AppendageT>
-        inline void AppendBytes(std::vector<uint8_t>& bytes, const AppendageT appendage)
+        namespace TextureSampling
         {
-            auto ptr = reinterpret_cast<const uint8_t*>(&appendage);
-            auto stride = static_cast<std::ptrdiff_t>(sizeof(AppendageT));
-            bytes.insert(bytes.end(), ptr, ptr + stride);
+            constexpr uint32_t SAMPLER_MAG_POINT = BGFX_SAMPLER_MAG_POINT;
+            constexpr uint32_t SAMPLER_MAG_LINEAR = 0;
+            constexpr uint32_t SAMPLER_MIN_POINT = BGFX_SAMPLER_MIN_POINT;
+            constexpr uint32_t SAMPLER_MIN_LINEAR = 0;
+            constexpr uint32_t SAMPLER_MIP_POINT = BGFX_SAMPLER_MIP_POINT;
+            constexpr uint32_t SAMPLER_MIP_LINEAR = 0;
+            constexpr uint32_t SAMPLER_MIP_IGNORE = BGFX_SAMPLER_MIP_POINT; // HACK: bgfx has no support for ignoring mips
+
+            // clang-format off
+            // Names, as in constants.ts are MAG_MIN(_MIP?)     MAG                     MIN                         MIP
+            constexpr uint32_t NEAREST_NEAREST =                SAMPLER_MAG_POINT   |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_IGNORE    ;
+            constexpr uint32_t LINEAR_LINEAR =                  SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_IGNORE    ;
+            constexpr uint32_t LINEAR_LINEAR_MIPLINEAR =        SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_LINEAR    ;
+            constexpr uint32_t NEAREST_NEAREST_MIPNEAREST =     SAMPLER_MAG_POINT   |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_POINT     ;
+            constexpr uint32_t NEAREST_LINEAR_MIPNEAREST =      SAMPLER_MAG_POINT   |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_POINT     ;
+            constexpr uint32_t NEAREST_LINEAR_MIPLINEAR =       SAMPLER_MAG_POINT   |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_LINEAR    ;
+            constexpr uint32_t NEAREST_LINEAR =                 SAMPLER_MAG_POINT   |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_IGNORE    ;
+            constexpr uint32_t NEAREST_NEAREST_MIPLINEAR =      SAMPLER_MAG_POINT   |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_LINEAR    ;
+            constexpr uint32_t LINEAR_NEAREST_MIPNEAREST =      SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_POINT     ;
+            constexpr uint32_t LINEAR_NEAREST_MIPLINEAR =       SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_LINEAR    ;
+            constexpr uint32_t LINEAR_LINEAR_MIPNEAREST =       SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_LINEAR    |     SAMPLER_MIP_POINT     ;
+            constexpr uint32_t LINEAR_NEAREST =                 SAMPLER_MAG_LINEAR  |   SAMPLER_MIN_POINT     |     SAMPLER_MIP_IGNORE    ;
+            // clang-format on
         }
 
-        template<typename AppendageT = std::string&>
-        inline void AppendBytes(std::vector<uint8_t>& bytes, const std::string& string)
+        namespace AlphaMode
         {
-            auto ptr = reinterpret_cast<const uint8_t*>(string.data());
-            auto stride = static_cast<std::ptrdiff_t>(string.length());
-            bytes.insert(bytes.end(), ptr, ptr + stride);
+            constexpr uint64_t DISABLE = 0x0;
+            constexpr uint64_t ADD = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t COMBINE = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t SUBTRACT = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t MULTIPLY = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_DST_COLOR, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t MAXIMIZED = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t ONEONE = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t PREMULTIPLIED = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE);
+            constexpr uint64_t PREMULTIPLIED_PORTERDUFF = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA);
+            constexpr uint64_t INTERPOLATE = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_FACTOR, BGFX_STATE_BLEND_INV_FACTOR, BGFX_STATE_BLEND_FACTOR, BGFX_STATE_BLEND_INV_FACTOR);
+            constexpr uint64_t SCREENMODE = BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA);
         }
-
-        template<typename ElementT>
-        inline void AppendBytes(std::vector<uint8_t>& bytes, const gsl::span<ElementT>& data)
-        {
-            auto ptr = reinterpret_cast<const uint8_t*>(data.data());
-            auto stride = static_cast<std::ptrdiff_t>(data.size() * sizeof(ElementT));
-            bytes.insert(bytes.end(), ptr, ptr + stride);
-        }
-
-        struct NonSamplerUniformsInfo
-        {
-            struct Uniform
-            {
-                enum class TypeEnum
-                {
-                    Vec4,
-                    Mat4
-                };
-
-                std::string Name{};
-                uint32_t Offset{};
-                uint16_t RegisterSize{};
-                TypeEnum Type{};
-            };
-
-            uint16_t ByteSize{};
-            std::vector<Uniform> Uniforms{};
-        };
-
-        void AppendUniformBuffer(std::vector<uint8_t>& bytes, const NonSamplerUniformsInfo& uniformBuffer, bool isFragment)
-        {
-            const uint8_t fragmentBit = (isFragment ? BGFX_UNIFORM_FRAGMENTBIT : 0);
-
-            for (const auto& uniform : uniformBuffer.Uniforms)
-            {
-                bgfx::UniformType::Enum bgfxType;
-
-                switch (uniform.Type)
-                {
-                    case NonSamplerUniformsInfo::Uniform::TypeEnum::Vec4:
-                        bgfxType = bgfx::UniformType::Vec4;
-                        break;
-                    case NonSamplerUniformsInfo::Uniform::TypeEnum::Mat4:
-                        bgfxType = bgfx::UniformType::Mat4;
-                        break;
-                    default:
-                        throw std::runtime_error{"Unrecognized uniform type."};
-                }
-
-                AppendBytes(bytes, static_cast<uint8_t>(uniform.Name.size()));
-                AppendBytes(bytes, uniform.Name);
-                AppendBytes(bytes, static_cast<uint8_t>(bgfxType | fragmentBit));
-                AppendBytes(bytes, static_cast<uint8_t>(0)); // Value "num" not used by D3D11 pipeline.
-                AppendBytes(bytes, static_cast<uint16_t>(uniform.Offset));
-                AppendBytes(bytes, static_cast<uint16_t>(uniform.RegisterSize));
-            }
-        }
-
-        void AppendSamplers(std::vector<uint8_t>& bytes, const spirv_cross::Compiler& compiler, const spirv_cross::SmallVector<spirv_cross::Resource>& samplers, bool /*isFragment*/, std::unordered_map<std::string, UniformInfo>& cache)
-        {
-            for (const spirv_cross::Resource& sampler : samplers)
-            {
-                AppendBytes(bytes, static_cast<uint8_t>(sampler.name.size()));
-                AppendBytes(bytes, sampler.name);
-                AppendBytes(bytes, static_cast<uint8_t>(bgfx::UniformType::Sampler | BGFX_UNIFORM_SAMPLERBIT));
-
-                // TODO : These values (num, regIndex, regCount) are only used by Vulkan and should be set for that API
-                AppendBytes(bytes, static_cast<uint8_t>(0));
-                AppendBytes(bytes, static_cast<uint16_t>(0));
-                AppendBytes(bytes, static_cast<uint16_t>(0));
-
-                cache[sampler.name].Stage = static_cast<uint8_t>(compiler.get_decoration(sampler.id, spv::DecorationBinding));
-            }
-        }
-
-        void CacheUniformHandles(bgfx::ShaderHandle shader, std::unordered_map<std::string, UniformInfo>& cache)
-        {
-            const auto MAX_UNIFORMS = 256;
-            bgfx::UniformHandle uniforms[MAX_UNIFORMS];
-            auto numUniforms = bgfx::getShaderUniforms(shader, uniforms, MAX_UNIFORMS);
-
-            bgfx::UniformInfo info{};
-            for (uint8_t idx = 0; idx < numUniforms; idx++)
-            {
-                bgfx::getUniformInfo(uniforms[idx], info);
-                cache[info.name].Handle = uniforms[idx];
-            }
-        }
-
-        enum class WebGLAttribType
-        {
-            BYTE = 5120,
-            UNSIGNED_BYTE = 5121,
-            SHORT = 5122,
-            UNSIGNED_SHORT = 5123,
-            INT = 5124,
-            UNSIGNED_INT = 5125,
-            FLOAT = 5126
-        };
-
-        bgfx::AttribType::Enum ConvertAttribType(WebGLAttribType type)
-        {
-            switch (type)
-            {
-                case WebGLAttribType::UNSIGNED_BYTE:
-                    return bgfx::AttribType::Uint8;
-                case WebGLAttribType::SHORT:
-                    return bgfx::AttribType::Int16;
-                case WebGLAttribType::FLOAT:
-                    return bgfx::AttribType::Float;
-                default: // avoid "warning: 4 enumeration values not handled"
-                    throw std::exception();
-                    break;
-            }
-        }
-
-        // Must match constants.ts in Babylon.js.
-        constexpr std::array<uint64_t, 11> ALPHA_MODE{
-            // ALPHA_DISABLE
-            0x0,
-
-            // ALPHA_ADD: SRC ALPHA * SRC + DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_COMBINE: SRC ALPHA * SRC + (1 - SRC ALPHA) * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_SUBTRACT: DEST - SRC * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_MULTIPLY: SRC * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_DST_COLOR, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_MAXIMIZED: SRC ALPHA * SRC + (1 - SRC) * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_ONEONE: SRC + DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_PREMULTIPLIED: SRC + (1 - SRC ALPHA) * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE),
-
-            // ALPHA_PREMULTIPLIED_PORTERDUFF: SRC + (1 - SRC ALPHA) * DEST, (1 - SRC ALPHA) * DEST ALPHA
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA),
-
-            // ALPHA_INTERPOLATE: CST * SRC + (1 - CST) * DEST
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_FACTOR, BGFX_STATE_BLEND_INV_FACTOR, BGFX_STATE_BLEND_FACTOR, BGFX_STATE_BLEND_INV_FACTOR),
-
-            // ALPHA_SCREENMODE: SRC + (1 - SRC) * DEST, SRC ALPHA + (1 - SRC ALPHA) * DEST ALPHA
-            BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_COLOR, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA),
-        };
-
-        constexpr std::array<bgfx::TextureFormat::Enum, 2> TEXTURE_FORMAT{
-            bgfx::TextureFormat::RGBA8,
-            bgfx::TextureFormat::RGBA32F};
 
         static_assert(static_cast<bgfx::TextureFormat::Enum>(bimg::TextureFormat::Count) == bgfx::TextureFormat::Count);
         static_assert(static_cast<bgfx::TextureFormat::Enum>(bimg::TextureFormat::RGBA8) == bgfx::TextureFormat::RGBA8);
@@ -215,374 +78,230 @@ namespace Babylon
             return static_cast<bgfx::TextureFormat::Enum>(format);
         }
 
-        void FlipY(bimg::ImageContainer* image)
+        using TransformFn = void (*)(const uint8_t*, uint8_t*);
+        void TransformImage(const bimg::ImageContainer* src, bimg::ImageContainer* dst, TransformFn transformFn)
         {
-            uint8_t* bytes = static_cast<uint8_t*>(image->m_data);
-            uint32_t rowCount = image->m_height;
-            uint32_t rowPitch = image->m_size / image->m_height;
+            const uint8_t* srcData{static_cast<const uint8_t*>(src->m_data)};
+            const uint8_t srcBytesPerPixel{static_cast<uint8_t>(bimg::getBitsPerPixel(src->m_format) >> 3)};
+            const uint8_t* srcDataEnd{srcData + src->m_size};
 
-            std::vector<uint8_t> buffer(rowPitch);
+            uint8_t* dstData{static_cast<uint8_t*>(dst->m_data)};
+            const uint8_t dstBytesPerPixel{static_cast<uint8_t>(bimg::getBitsPerPixel(dst->m_format) >> 3)};
+            const uint8_t* dstDataEnd{dstData + dst->m_size};
 
-            for (size_t row = 0; row < rowCount / 2; row++)
+            while (srcData < srcDataEnd && dstData < dstDataEnd)
             {
-                auto frontPtr = bytes + (row * rowPitch);
-                auto backPtr = bytes + ((rowCount - row - 1) * rowPitch);
-
-                std::memcpy(buffer.data(), frontPtr, rowPitch);
-                std::memcpy(frontPtr, backPtr, rowPitch);
-                std::memcpy(backPtr, buffer.data(), rowPitch);
+                transformFn(srcData, dstData);
+                srcData += srcBytesPerPixel;
+                dstData += dstBytesPerPixel;
             }
         }
 
-        void GenerateMips(bx::AllocatorI* allocator, bimg::ImageContainer** image)
+        bimg::ImageContainer* ParseImage(bx::AllocatorI& allocator, gsl::span<uint8_t> data)
         {
-            bimg::ImageContainer* input = *image;
-
-            bimg::ImageContainer* output = bimg::imageGenerateMips(allocator, *input);
-            if (output == nullptr)
+            bimg::ImageContainer* image{bimg::imageParse(&allocator, data.data(), static_cast<uint32_t>(data.size()))};
+            if (image == nullptr)
             {
-                bimg::TextureFormat::Enum format = input->m_format;
-                bimg::ImageContainer* rgba = bimg::imageConvert(allocator, bimg::TextureFormat::RGBA8, *input, false);
-                bimg::imageFree(input);
-                bimg::ImageContainer* mips = bimg::imageGenerateMips(allocator, *rgba);
-                bimg::imageFree(rgba);
-                output = bimg::imageConvert(allocator, format, *mips);
-                bimg::imageFree(mips);
+                throw std::runtime_error{"Failed to parse image."};
+            }
+
+            if (image->m_format == bimg::TextureFormat::R8 ||
+                image->m_format == bimg::TextureFormat::RG8)
+            {
+                static const TransformFn UnpackR8{[](const uint8_t* src, uint8_t* dst) { dst[0] = dst[1] = dst[2] = src[0]; dst[3] = 1; }};
+                static const TransformFn UnpackRG8{[](const uint8_t* src, uint8_t* dst) { dst[0] = dst[1] = dst[2] = src[0]; dst[3] = src[1]; }};
+
+                // bimg loads grayscale textures with and without alpha as R8 and RG8 respectively.
+                // Unpack to RGB and RGBA such that RGB is the grayscale and the A is the alpha.
+                bimg::ImageContainer* oldImage{image};
+                image = bimg::imageAlloc(&allocator, bimg::TextureFormat::RGBA8, static_cast<uint16_t>(image->m_width), static_cast<uint16_t>(image->m_height), 1, 1, false, false);
+                TransformImage(oldImage, image, image->m_format == bimg::TextureFormat::R8 ? UnpackR8 : UnpackRG8);
+                bimg::imageFree(oldImage);
+            }
+
+            return image;
+        }
+
+        bimg::ImageContainer* PrepareImage(bx::AllocatorI& allocator, bimg::ImageContainer* image, bool invertY, bool srgb, bool generateMips)
+        {
+            assert(
+                image->m_format == bimg::TextureFormat::RGB8 ||
+                image->m_format == bimg::TextureFormat::RGBA8 ||
+                image->m_format == bimg::TextureFormat::RGBA16 ||
+                image->m_format == bimg::TextureFormat::RGBA32F);
+
+            assert(image->m_depth == 1);
+            assert(image->m_numLayers == 1);
+            assert(image->m_numMips == 1);
+            assert(image->m_cubeMap == false);
+
+            if (bgfx::getCaps()->originBottomLeft ? invertY : !invertY)
+            {
+                uint8_t* bytes{static_cast<uint8_t*>(image->m_data)};
+                const uint32_t rowCount{image->m_height};
+                const uint32_t rowPitch{image->m_size / image->m_height};
+
+                std::vector<uint8_t> buffer(rowPitch);
+                for (size_t row = 0; row < rowCount / 2; row++)
+                {
+                    uint8_t* frontPtr{bytes + (row * rowPitch)};
+                    uint8_t* backPtr{bytes + ((rowCount - row - 1) * rowPitch)};
+
+                    std::memcpy(buffer.data(), frontPtr, rowPitch);
+                    std::memcpy(frontPtr, backPtr, rowPitch);
+                    std::memcpy(backPtr, buffer.data(), rowPitch);
+                }
+            }
+
+            if (srgb && !bgfx::isTextureValid(1, false, 1, Cast(image->m_format), BGFX_TEXTURE_SRGB))
+            {
+                bimg::ImageContainer* oldImage{image};
+                image = bimg::imageConvert(&allocator, bimg::TextureFormat::RGBA8, *image, false);
+                bimg::imageFree(oldImage);
+
+                assert(bgfx::isTextureValid(1, false, 1, Cast(image->m_format), BGFX_TEXTURE_SRGB));
+            }
+
+            if (generateMips)
+            {
+                if (image->m_format == bimg::TextureFormat::RGB8)
+                {
+                    bimg::ImageContainer* oldImage{image};
+                    image = bimg::imageConvert(&allocator, bimg::TextureFormat::RGBA8, *image, false);
+                    bimg::imageFree(oldImage);
+                }
+                else if (image->m_format == bimg::TextureFormat::RGBA16)
+                {
+                    bimg::ImageContainer* oldImage{image};
+                    image = bimg::imageConvert(&allocator, bimg::TextureFormat::RGBA32F, *image, false);
+                    bimg::imageFree(oldImage);
+                }
+
+                bimg::ImageContainer* oldImage{image};
+                image = bimg::imageGenerateMips(&allocator, *image);
+                bimg::imageFree(oldImage);
+            }
+
+            assert(image != nullptr);
+            return image;
+        }
+
+        void LoadTextureFromImage(TextureData* texture, bimg::ImageContainer* image, bool srgb)
+        {
+            if (bgfx::isValid(texture->Handle))
+            {
+                if (texture->Width != image->m_width || texture->Height != image->m_height)
+                {
+                    throw std::runtime_error{"Cannot update texture from image of different size"};
+                }
             }
             else
             {
-                bimg::imageFree(input);
+                uint64_t flags{(srgb ? BGFX_TEXTURE_SRGB : BGFX_TEXTURE_NONE) | BGFX_SAMPLER_NONE};
+                texture->Handle = bgfx::createTexture2D(static_cast<uint16_t>(image->m_width), static_cast<uint16_t>(image->m_height), (image->m_numMips > 1), 1, Cast(image->m_format), flags);
+                texture->Width = image->m_width;
+                texture->Height = image->m_height;
             }
 
-            *image = output;
-        }
-
-        void CreateTextureFromImage(TextureData* texture, bimg::ImageContainer* image)
-        {
-            auto releaseFn = [](void* /*ptr*/, void* userData) {
-                bimg::imageFree(static_cast<bimg::ImageContainer*>(userData));
-            };
-
-            auto mem = bgfx::makeRef(image->m_data, image->m_size, releaseFn, image);
-
-            texture->Handle = bgfx::createTexture2D(static_cast<uint16_t>(image->m_width), static_cast<uint16_t>(image->m_height), (image->m_numMips > 1), 1, Cast(image->m_format), BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE, mem);
-            texture->Width = image->m_width;
-            texture->Height = image->m_height;
-        }
-
-        void CreateCubeTextureFromImages(TextureData* texture, const std::vector<bimg::ImageContainer*>& images, bool hasMips)
-        {
-            const bimg::ImageContainer* firstImage = images.front();
-            uint32_t width = firstImage->m_width;
-            uint32_t height = firstImage->m_height;
-            bgfx::TextureFormat::Enum format = Cast(firstImage->m_format);
-
-            uint32_t totalSize = 0;
-            for (auto image : images)
+            for (uint8_t mip = 0; mip < image->m_numMips; ++mip)
             {
-                totalSize += image->m_size;
-            }
-
-            // Combine all the faces into one chunk.
-            const bgfx::Memory* mem = bgfx::alloc(totalSize);
-            uint8_t* ptr = mem->data;
-            for (bimg::ImageContainer* image : images)
-            {
-                std::memcpy(ptr, image->m_data, image->m_size);
-                ptr += image->m_size;
-                bimg::imageFree(image);
-            }
-
-            texture->Handle = bgfx::createTextureCube(static_cast<uint16_t>(width), hasMips, 1, format, BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE, mem);
-            texture->Width = width;
-            texture->Height = height;
-        }
-
-        NonSamplerUniformsInfo CollectNonSamplerUniforms(spirv_cross::Parser& parser, const spirv_cross::Compiler& compiler)
-        {
-            NonSamplerUniformsInfo info{};
-
-            const auto& resources = compiler.get_shader_resources();
-            if (resources.uniform_buffers.size() == 1)
-            {
-                const auto& uniformBuffer = resources.uniform_buffers[0];
-                const auto& type = compiler.get_type(uniformBuffer.base_type_id);
-                assert(type.basetype == spirv_cross::SPIRType::BaseType::Struct);
-
-                info.ByteSize = static_cast<uint16_t>(compiler.get_declared_struct_size(type));
-
-                info.Uniforms.resize(type.member_types.size());
-                for (uint32_t index = 0; index < type.member_types.size(); ++index)
+                bimg::ImageMip imageMip{};
+                if (bimg::imageGetRawData(*image, 0, mip, image->m_data, image->m_size, imageMip))
                 {
-                    auto& uniform = info.Uniforms[index];
-
-                    uniform.Name = compiler.get_member_name(uniformBuffer.base_type_id, index);
-                    uniform.Offset = compiler.get_member_decoration(uniformBuffer.base_type_id, index, spv::DecorationOffset);
-                    
-                    const auto spirType = compiler.get_type(type.member_types[index]);
-                    if (spirType.columns == 1 && 1 <= spirType.vecsize && spirType.vecsize <= 4)
+                    bgfx::ReleaseFn releaseFn{};
+                    if (mip == image->m_numMips - 1)
                     {
-                        uniform.Type = NonSamplerUniformsInfo::Uniform::TypeEnum::Vec4;
-                        uniform.RegisterSize = 1;
-                    }
-                    else if (spirType.columns == 4 && spirType.vecsize == 4)
-                    {
-                        uniform.Type = NonSamplerUniformsInfo::Uniform::TypeEnum::Mat4;
-                        uniform.RegisterSize = 4;
-                    }
-                    else
-                    {
-                        throw std::runtime_error{"Unrecognized uniform type."};
+                        releaseFn = [](void*, void* userData) {
+                            bimg::imageFree(static_cast<bimg::ImageContainer*>(userData));
+                        };
                     }
 
-                    for (const auto size : spirType.array)
+                    const bgfx::Memory* mem{bgfx::makeRef(imageMip.m_data, imageMip.m_size, releaseFn, image)};
+                    bgfx::updateTexture2D(texture->Handle, 0, mip, 0, 0, static_cast<uint16_t>(imageMip.m_width), static_cast<uint16_t>(imageMip.m_height), mem);
+                }
+            }
+        }
+
+        void LoadCubeTextureFromImages(TextureData* texture, std::vector<bimg::ImageContainer*>& images, bool srgb)
+        {
+            const bimg::ImageContainer* firstImage{images.front()};
+            assert(firstImage->m_width == firstImage->m_height);
+            uint32_t size{firstImage->m_width};
+
+            if (bgfx::isValid(texture->Handle))
+            {
+                if (texture->Width != size || texture->Height != size)
+                {
+                    throw std::runtime_error{"Cannot update texture from image of different size"};
+                }
+            }
+            else
+            {
+                bool hasMips{images.size() > 6 || firstImage->m_numMips > 1};
+                bgfx::TextureFormat::Enum format{Cast(firstImage->m_format)};
+                uint64_t flags{(srgb ? BGFX_TEXTURE_SRGB : BGFX_TEXTURE_NONE) | BGFX_SAMPLER_NONE};
+                texture->Handle = bgfx::createTextureCube(static_cast<uint16_t>(size), hasMips, 1, format, flags);
+                texture->Width = size;
+                texture->Height = size;
+            }
+
+            if (images.size() > 6)
+            {
+                assert(images.size() % 6 == 0);
+                const uint8_t numMips{static_cast<uint8_t>(images.size() / 6)};
+                for (uint8_t side = 0; side < 6; ++side)
+                {
+                    for (uint8_t mip = 0; mip < numMips; ++mip)
                     {
-                        uniform.RegisterSize *= static_cast<uint16_t>(size);
+                        bimg::ImageContainer* image{images[(side * numMips) + mip]};
+
+                        bgfx::ReleaseFn releaseFn{[](void*, void* userData) {
+                            bimg::imageFree(static_cast<bimg::ImageContainer*>(userData));
+                        }};
+
+                        const bgfx::Memory* mem{bgfx::makeRef(image->m_data, image->m_size, releaseFn, image)};
+                        bgfx::updateTextureCube(texture->Handle, 0, side, mip, 0, 0, static_cast<uint16_t>(image->m_width), static_cast<uint16_t>(image->m_height), mem);
                     }
                 }
             }
             else
             {
-                info.ByteSize = 0;
-                parser.get_parsed_ir().for_each_typed_id<spirv_cross::SPIRVariable>([&](uint32_t id, spirv_cross::SPIRVariable& var) {
-                    auto& type = compiler.get_type_from_variable(id);
-                    if (var.storage == spv::StorageClassUniformConstant &&
-                        type.basetype != spirv_cross::SPIRType::BaseType::SampledImage &&
-                        type.basetype != spirv_cross::SPIRType::BaseType::Sampler)
+                for (uint8_t side = 0; side < 6; ++side)
+                {
+                    bimg::ImageContainer* image{images[side]};
+                    for (uint8_t mip = 0; mip < image->m_numMips; ++mip)
                     {
-                        auto& uniform = info.Uniforms.emplace_back();
-                        uniform.Name = compiler.get_name(id);
-                        uniform.Offset = 0; // Not actually used for anything by OpenGL.
-                        
-                        if (type.columns == 1 && 1 <= type.vecsize && type.vecsize <= 4)
+                        bimg::ImageMip imageMip{};
+                        if (bimg::imageGetRawData(*image, 0, mip, image->m_data, image->m_size, imageMip))
                         {
-                            uniform.Type = NonSamplerUniformsInfo::Uniform::TypeEnum::Vec4;
-                            uniform.RegisterSize = 1;
-                        }
-                        else if (type.columns == 4 && type.vecsize == 4)
-                        {
-                            uniform.Type = NonSamplerUniformsInfo::Uniform::TypeEnum::Mat4;
-                            uniform.RegisterSize = 4;
-                        }
-                        else
-                        {
-                            throw std::runtime_error{"Unrecognized uniform type."};
-                        }
+                            bgfx::ReleaseFn releaseFn{};
+                            if (mip == image->m_numMips - 1)
+                            {
+                                releaseFn = [](void*, void* userData) {
+                                    bimg::imageFree(static_cast<bimg::ImageContainer*>(userData));
+                                };
+                            }
 
-                        for (const auto size : type.array)
-                        {
-                            uniform.RegisterSize *= static_cast<uint16_t>(size);
+                            const bgfx::Memory* mem{bgfx::makeRef(imageMip.m_data, imageMip.m_size, releaseFn, image)};
+                            bgfx::updateTextureCube(texture->Handle, 0, side, mip, 0, 0, static_cast<uint16_t>(imageMip.m_width), static_cast<uint16_t>(imageMip.m_height), mem);
                         }
-
-                        info.ByteSize += 4 * uniform.RegisterSize;
                     }
-                });
-            }
-
-            return info;
-        }
-    }
-
-    template<typename Handle1T, typename Handle2T>
-    class VariantHandleHolder
-    {
-    public:
-        std::variant<Handle1T, Handle2T> m_handle{};
-
-        template<typename NonDynamicCallableT, typename DynamicCallableT>
-        void DoForHandleTypes(NonDynamicCallableT& nonDynamicCallable, DynamicCallableT& dynamicCallable) const
-        {
-            if (auto handle = std::get_if<Handle1T>(&m_handle))
-            {
-                nonDynamicCallable(*handle);
-            }
-            else
-            {
-                dynamicCallable(std::get<Handle2T>(m_handle));
-            }
-        }
-    };
-
-    class IndexBufferData final : private VariantHandleHolder<bgfx::IndexBufferHandle, bgfx::DynamicIndexBufferHandle>
-    {
-    public:
-        IndexBufferData(const Napi::TypedArray& bytes, uint16_t flags, bool dynamic)
-        {
-            const bgfx::Memory* memory = bgfx::copy(bytes.As<Napi::Uint8Array>().Data(), static_cast<uint32_t>(bytes.ByteLength()));
-            if (!dynamic)
-            {
-                m_handle = bgfx::createIndexBuffer(memory, flags);
-            }
-            else
-            {
-                m_handle = bgfx::createDynamicIndexBuffer(memory, flags);
-            }
-        }
-
-        ~IndexBufferData()
-        {
-            constexpr auto nonDynamic = [](auto handle) {
-                bgfx::destroy(handle);
-            };
-            constexpr auto dynamic = [](auto handle) {
-                bgfx::destroy(handle);
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
-        }
-
-        void Update(const Napi::TypedArray& bytes, uint32_t startingIdx)
-        {
-            const bgfx::Memory* memory = bgfx::copy(bytes.As<Napi::Uint8Array>().Data(), static_cast<uint32_t>(bytes.ByteLength()));
-
-            constexpr auto nonDynamic = [](auto) {
-                throw std::runtime_error("Cannot update a non-dynamic index buffer.");
-            };
-            const auto dynamic = [memory, startingIdx](auto handle) {
-                bgfx::update(handle, startingIdx, memory);
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
-        }
-
-        void SetBgfxIndexBuffer() const
-        {
-            constexpr auto nonDynamic = [](auto handle) {
-                bgfx::setIndexBuffer(handle);
-            };
-            constexpr auto dynamic = [](auto handle) {
-                bgfx::setIndexBuffer(handle);
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
-        }
-    };
-
-    class VertexBufferData final : VariantHandleHolder<bgfx::VertexBufferHandle, bgfx::DynamicVertexBufferHandle>
-    {
-    public:
-        VertexBufferData(const Napi::Uint8Array& bytes, bool dynamic)
-            : m_bytes{bytes.Data(), bytes.Data() + bytes.ByteLength()}
-        {
-            if (!dynamic)
-            {
-                m_handle = bgfx::VertexBufferHandle{bgfx::kInvalidHandle};
-            }
-            else
-            {
-                m_handle = bgfx::DynamicVertexBufferHandle{bgfx::kInvalidHandle};
-            }
-        }
-
-        ~VertexBufferData()
-        {
-            constexpr auto nonDynamic = [](auto handle) {
-                if (handle.idx != bgfx::kInvalidHandle)
-                {
-                    bgfx::destroy(handle);
                 }
-            };
-            constexpr auto dynamic = [](auto handle) {
-                if (handle.idx != bgfx::kInvalidHandle)
-                {
-                    bgfx::destroy(handle);
-                }
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
+            }
         }
 
-        void EnsureFinalized(Napi::Env /*env*/, const bgfx::VertexLayout& layout)
+        void CreateBlitTexture(TextureData* texture)
         {
-            const auto nonDynamic = [&layout, this](auto handle) {
-                if (handle.idx != bgfx::kInvalidHandle)
-                {
-                    return;
-                }
-
-                const bgfx::Memory* memory = bgfx::makeRef(
-                    m_bytes.data(), static_cast<uint32_t>(m_bytes.size()), [](void*, void* userData) {
-                        auto* bytes = reinterpret_cast<std::vector<uint8_t>*>(userData);
-                        bytes->clear();
-                    },
-                    &m_bytes);
-
-                m_handle = bgfx::createVertexBuffer(memory, layout);
-            };
-            const auto dynamic = [&layout, this](auto handle) {
-                if (handle.idx != bgfx::kInvalidHandle)
-                {
-                    return;
-                }
-
-                const bgfx::Memory* memory = bgfx::makeRef(
-                    m_bytes.data(), static_cast<uint32_t>(m_bytes.size()), [](void*, void* userData) {
-                        auto* bytes = reinterpret_cast<std::vector<uint8_t>*>(userData);
-                        bytes->clear();
-                    },
-                    &m_bytes);
-
-                m_handle = bgfx::createDynamicVertexBuffer(memory, layout);
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
+            if (texture->CreationFlags & BGFX_TEXTURE_BLIT_DST)
+            {
+                return;
+            }
+            bgfx::destroy(texture->Handle);
+            texture->Handle = bgfx::createTexture2D((uint16_t)texture->Width, (uint16_t)texture->Height, false, 1, bgfx::TextureFormat::RGBA8, BGFX_TEXTURE_BLIT_DST);
+            texture->CreationFlags |= BGFX_TEXTURE_BLIT_DST;
         }
 
-        void Update(const Napi::Uint8Array& bytes, uint32_t offset, uint32_t byteLength)
-        {
-            constexpr auto nonDynamic = [](auto) {
-                throw std::runtime_error("Cannot update non-dynamic vertex buffer.");
-            };
-            const auto dynamic = [&bytes, offset, byteLength, this](auto handle) {
-                if (handle.idx == bgfx::kInvalidHandle)
-                {
-                    // Buffer hasn't been finalized yet, all that's necessary is to swap out the bytes.
-                    m_bytes = {bytes.Data() + offset, bytes.Data() + offset + byteLength};
-                }
-                else
-                {
-                    // Buffer was already created, do a real update operation.
-                    const bgfx::Memory* memory = bgfx::copy(bytes.Data() + offset, byteLength);
-                    bgfx::update(handle, 0, memory);
-                }
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
-        }
-
-        void SetAsBgfxVertexBuffer(uint8_t index, uint32_t startVertex, bgfx::VertexLayoutHandle layout) const
-        {
-            const auto nonDynamic = [index, startVertex, layout](auto handle) {
-                bgfx::setVertexBuffer(index, handle, startVertex, UINT32_MAX, layout);
-            };
-            const auto dynamic = [index, startVertex, layout](auto handle) {
-                bgfx::setVertexBuffer(index, handle, startVertex, UINT32_MAX, layout);
-            };
-            DoForHandleTypes(nonDynamic, dynamic);
-        }
-
-    private:
-        std::vector<uint8_t> m_bytes{};
-    };
-
-    void NativeEngine::InitializeWindow(void* nativeWindowPtr, uint32_t width, uint32_t height)
-    {
-        // Initialize bgfx.
-        bgfx::Init init{};
-        init.platformData.nwh = nativeWindowPtr;
-        bgfx::setPlatformData(init.platformData);
-#if (ANDROID)
-        init.type = bgfx::RendererType::OpenGLES;
-#else
-        init.type = bgfx::RendererType::Direct3D11;
-#endif
-        init.resolution.width = width;
-        init.resolution.height = height;
-        init.resolution.reset = BGFX_RESET_FLAGS;
-        init.callback = &s_bgfxCallback;
-        bgfx::init(init);
-        bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x443355FF, 1.0f, 0);
-        bgfx::setViewRect(0, 0, 0, static_cast<uint16_t>(init.resolution.width), static_cast<uint16_t>(init.resolution.height));
-        bgfx::touch(0);
-    }
-
-    void NativeEngine::DeinitializeWindow()
-    {
-        bgfx::shutdown();
+        using CommandFunctionPointerT = void(NativeEngine::*)(NativeDataStream::Reader&);
     }
 
     void NativeEngine::Initialize(Napi::Env env)
@@ -590,97 +309,214 @@ namespace Babylon
         // Initialize the JavaScript side.
         Napi::HandleScope scope{env};
 
+        // clang-format off
         Napi::Function func = DefineClass(
             env,
             JS_CLASS_NAME,
             {
+                // This must match the version in nativeEngine.ts
+                StaticValue("PROTOCOL_VERSION", Napi::Number::From(env, 4)),
+
+                StaticValue("TEXTURE_NEAREST_NEAREST", Napi::Number::From(env, TextureSampling::NEAREST_NEAREST)),
+                StaticValue("TEXTURE_LINEAR_LINEAR", Napi::Number::From(env, TextureSampling::LINEAR_LINEAR)),
+                StaticValue("TEXTURE_LINEAR_LINEAR_MIPLINEAR", Napi::Number::From(env, TextureSampling::LINEAR_LINEAR_MIPLINEAR)),
+                StaticValue("TEXTURE_NEAREST_NEAREST_MIPNEAREST", Napi::Number::From(env, TextureSampling::NEAREST_NEAREST_MIPNEAREST)),
+                StaticValue("TEXTURE_NEAREST_LINEAR_MIPNEAREST", Napi::Number::From(env, TextureSampling::NEAREST_LINEAR_MIPNEAREST)),
+                StaticValue("TEXTURE_NEAREST_LINEAR_MIPLINEAR", Napi::Number::From(env, TextureSampling::NEAREST_LINEAR_MIPLINEAR)),
+                StaticValue("TEXTURE_NEAREST_LINEAR", Napi::Number::From(env, TextureSampling::NEAREST_LINEAR)),
+                StaticValue("TEXTURE_NEAREST_NEAREST_MIPLINEAR", Napi::Number::From(env, TextureSampling::NEAREST_NEAREST_MIPLINEAR)),
+                StaticValue("TEXTURE_LINEAR_NEAREST_MIPNEAREST", Napi::Number::From(env, TextureSampling::LINEAR_NEAREST_MIPNEAREST)),
+                StaticValue("TEXTURE_LINEAR_NEAREST_MIPLINEAR", Napi::Number::From(env, TextureSampling::LINEAR_NEAREST_MIPLINEAR)),
+                StaticValue("TEXTURE_LINEAR_LINEAR_MIPNEAREST", Napi::Number::From(env, TextureSampling::LINEAR_LINEAR_MIPNEAREST)),
+                StaticValue("TEXTURE_LINEAR_NEAREST", Napi::Number::From(env, TextureSampling::LINEAR_NEAREST)),
+
+                StaticValue("DEPTH_TEST_LESS", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_LESS)),
+                StaticValue("DEPTH_TEST_LEQUAL", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_LEQUAL)),
+                StaticValue("DEPTH_TEST_EQUAL", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_EQUAL)),
+                StaticValue("DEPTH_TEST_GEQUAL", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_GEQUAL)),
+                StaticValue("DEPTH_TEST_GREATER", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_GREATER)),
+                StaticValue("DEPTH_TEST_NOTEQUAL", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_NOTEQUAL)),
+                StaticValue("DEPTH_TEST_NEVER", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_NEVER)),
+                StaticValue("DEPTH_TEST_ALWAYS", Napi::Number::From(env, BGFX_STATE_DEPTH_TEST_ALWAYS)),
+
+                StaticValue("CLEAR_FLAG_COLOR", Napi::Number::From(env, BGFX_CLEAR_COLOR)),
+                StaticValue("CLEAR_FLAG_DEPTH", Napi::Number::From(env, BGFX_CLEAR_DEPTH)),
+                StaticValue("CLEAR_FLAG_STENCIL", Napi::Number::From(env, BGFX_CLEAR_STENCIL)),
+
+                StaticValue("ADDRESS_MODE_WRAP", Napi::Number::From(env, 0)),
+                StaticValue("ADDRESS_MODE_MIRROR", Napi::Number::From(env, BGFX_SAMPLER_U_MIRROR)),
+                StaticValue("ADDRESS_MODE_CLAMP", Napi::Number::From(env, BGFX_SAMPLER_U_CLAMP)),
+                StaticValue("ADDRESS_MODE_BORDER", Napi::Number::From(env, BGFX_SAMPLER_U_BORDER)),
+                StaticValue("ADDRESS_MODE_MIRROR_ONCE", Napi::Number::From(env, BGFX_SAMPLER_U_MIRROR)),
+
+                StaticValue("TEXTURE_FORMAT_RGB8", Napi::Number::From(env, static_cast<uint32_t>(bgfx::TextureFormat::RGB8))),
+                StaticValue("TEXTURE_FORMAT_RGBA8", Napi::Number::From(env, static_cast<uint32_t>(bgfx::TextureFormat::RGBA8))),
+                StaticValue("TEXTURE_FORMAT_RGBA32F", Napi::Number::From(env, static_cast<uint32_t>(bgfx::TextureFormat::RGBA32F))),
+
+                StaticValue("ATTRIB_TYPE_INT8", Napi::Number::From(env, static_cast<uint32_t>(bgfx::AttribType::Int8))),
+                StaticValue("ATTRIB_TYPE_UINT8", Napi::Number::From(env, static_cast<uint32_t>(bgfx::AttribType::Uint8))),
+                StaticValue("ATTRIB_TYPE_INT16", Napi::Number::From(env, static_cast<uint32_t>(bgfx::AttribType::Int16))),
+                StaticValue("ATTRIB_TYPE_UINT16", Napi::Number::From(env, static_cast<uint32_t>(bgfx::AttribType::Uint16))),
+                StaticValue("ATTRIB_TYPE_FLOAT", Napi::Number::From(env, static_cast<uint32_t>(bgfx::AttribType::Float))),
+
+                StaticValue("ALPHA_DISABLE", Napi::Number::From(env, AlphaMode::DISABLE)),
+                StaticValue("ALPHA_ADD", Napi::Number::From(env, AlphaMode::ADD)),
+                StaticValue("ALPHA_COMBINE", Napi::Number::From(env, AlphaMode::COMBINE)),
+                StaticValue("ALPHA_SUBTRACT", Napi::Number::From(env, AlphaMode::SUBTRACT)),
+                StaticValue("ALPHA_MULTIPLY", Napi::Number::From(env, AlphaMode::MULTIPLY)),
+                StaticValue("ALPHA_MAXIMIZED", Napi::Number::From(env, AlphaMode::MAXIMIZED)),
+                StaticValue("ALPHA_ONEONE", Napi::Number::From(env, AlphaMode::ONEONE)),
+                StaticValue("ALPHA_PREMULTIPLIED", Napi::Number::From(env, AlphaMode::PREMULTIPLIED)),
+                StaticValue("ALPHA_PREMULTIPLIED_PORTERDUFF", Napi::Number::From(env, AlphaMode::PREMULTIPLIED_PORTERDUFF)),
+                StaticValue("ALPHA_INTERPOLATE", Napi::Number::From(env, AlphaMode::INTERPOLATE)),
+                StaticValue("ALPHA_SCREENMODE", Napi::Number::From(env, AlphaMode::SCREENMODE)),
+
+                StaticValue("STENCIL_TEST_LESS", Napi::Number::From(env, BGFX_STENCIL_TEST_LESS)),
+                StaticValue("STENCIL_TEST_LEQUAL", Napi::Number::From(env, BGFX_STENCIL_TEST_LEQUAL)),
+                StaticValue("STENCIL_TEST_EQUAL", Napi::Number::From(env, BGFX_STENCIL_TEST_EQUAL)),
+                StaticValue("STENCIL_TEST_GEQUAL", Napi::Number::From(env, BGFX_STENCIL_TEST_GEQUAL)),
+                StaticValue("STENCIL_TEST_GREATER", Napi::Number::From(env, BGFX_STENCIL_TEST_GREATER)),
+                StaticValue("STENCIL_TEST_NOTEQUAL", Napi::Number::From(env, BGFX_STENCIL_TEST_NOTEQUAL)),
+                StaticValue("STENCIL_TEST_NEVER", Napi::Number::From(env, BGFX_STENCIL_TEST_NEVER)),
+                StaticValue("STENCIL_TEST_ALWAYS", Napi::Number::From(env, BGFX_STENCIL_TEST_ALWAYS)),
+
+                StaticValue("STENCIL_OP_FAIL_S_ZERO", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_ZERO)),
+                StaticValue("STENCIL_OP_FAIL_S_KEEP", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_KEEP)),
+                StaticValue("STENCIL_OP_FAIL_S_REPLACE", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_REPLACE)),
+                StaticValue("STENCIL_OP_FAIL_S_INCR", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_INCR)),
+                StaticValue("STENCIL_OP_FAIL_S_INCRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_INCRSAT)),
+                StaticValue("STENCIL_OP_FAIL_S_DECR", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_DECR)),
+                StaticValue("STENCIL_OP_FAIL_S_DECRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_DECRSAT)),
+                StaticValue("STENCIL_OP_FAIL_S_INVERT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_S_INVERT)),
+
+                StaticValue("STENCIL_OP_FAIL_Z_ZERO", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_ZERO)),
+                StaticValue("STENCIL_OP_FAIL_Z_KEEP", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_KEEP)),
+                StaticValue("STENCIL_OP_FAIL_Z_REPLACE", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_REPLACE)),
+                StaticValue("STENCIL_OP_FAIL_Z_INCR", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_INCR)),
+                StaticValue("STENCIL_OP_FAIL_Z_INCRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_INCRSAT)),
+                StaticValue("STENCIL_OP_FAIL_Z_DECR", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_DECR)),
+                StaticValue("STENCIL_OP_FAIL_Z_DECRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_DECRSAT)),
+                StaticValue("STENCIL_OP_FAIL_Z_INVERT", Napi::Number::From(env, BGFX_STENCIL_OP_FAIL_Z_INVERT)),
+
+                StaticValue("STENCIL_OP_PASS_Z_ZERO", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_ZERO)),
+                StaticValue("STENCIL_OP_PASS_Z_KEEP", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_KEEP)),
+                StaticValue("STENCIL_OP_PASS_Z_REPLACE", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_REPLACE)),
+                StaticValue("STENCIL_OP_PASS_Z_INCR", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_INCR)),
+                StaticValue("STENCIL_OP_PASS_Z_INCRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_INCRSAT)),
+                StaticValue("STENCIL_OP_PASS_Z_DECR", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_DECR)),
+                StaticValue("STENCIL_OP_PASS_Z_DECRSAT", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_DECRSAT)),
+                StaticValue("STENCIL_OP_PASS_Z_INVERT", Napi::Number::From(env, BGFX_STENCIL_OP_PASS_Z_INVERT)),
+
+                StaticValue("COMMAND_DELETEVERTEXARRAY", Napi::FunctionPointer::Create(env, &NativeEngine::DeleteVertexArray)),
+                StaticValue("COMMAND_DELETEINDEXBUFFER", Napi::FunctionPointer::Create(env, &NativeEngine::DeleteIndexBuffer)),
+                StaticValue("COMMAND_DELETEVERTEXBUFFER", Napi::FunctionPointer::Create(env, &NativeEngine::DeleteVertexBuffer)),
+                StaticValue("COMMAND_SETPROGRAM", Napi::FunctionPointer::Create(env, &NativeEngine::SetProgram)),
+                StaticValue("COMMAND_DELETEPROGRAM", Napi::FunctionPointer::Create(env, &NativeEngine::DeleteProgram)),
+                StaticValue("COMMAND_SETMATRICES", Napi::FunctionPointer::Create(env, &NativeEngine::SetMatrices)),
+                StaticValue("COMMAND_SETMATRIX", Napi::FunctionPointer::Create(env, &NativeEngine::SetMatrix)),
+                StaticValue("COMMAND_SETMATRIX3X3", Napi::FunctionPointer::Create(env, &NativeEngine::SetMatrix3x3)),
+                StaticValue("COMMAND_SETMATRIX2X2", Napi::FunctionPointer::Create(env, &NativeEngine::SetMatrix2x2)),
+                StaticValue("COMMAND_SETINT", Napi::FunctionPointer::Create(env, &NativeEngine::SetInt)),
+                StaticValue("COMMAND_SETINTARRAY", Napi::FunctionPointer::Create(env, &NativeEngine::SetIntArray)),
+                StaticValue("COMMAND_SETINTARRAY2", Napi::FunctionPointer::Create(env, &NativeEngine::SetIntArray2)),
+                StaticValue("COMMAND_SETINTARRAY3", Napi::FunctionPointer::Create(env, &NativeEngine::SetIntArray3)),
+                StaticValue("COMMAND_SETINTARRAY4", Napi::FunctionPointer::Create(env, &NativeEngine::SetIntArray4)),
+                StaticValue("COMMAND_SETFLOATARRAY", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloatArray)),
+                StaticValue("COMMAND_SETFLOATARRAY2", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloatArray2)),
+                StaticValue("COMMAND_SETFLOATARRAY3", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloatArray3)),
+                StaticValue("COMMAND_SETFLOATARRAY4", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloatArray4)),
+                StaticValue("COMMAND_SETTEXTURESAMPLING", Napi::FunctionPointer::Create(env, &NativeEngine::SetTextureSampling)),
+                StaticValue("COMMAND_SETTEXTUREWRAPMODE", Napi::FunctionPointer::Create(env, &NativeEngine::SetTextureWrapMode)),
+                StaticValue("COMMAND_SETTEXTUREANISOTROPICLEVEL", Napi::FunctionPointer::Create(env, &NativeEngine::SetTextureAnisotropicLevel)),
+                StaticValue("COMMAND_SETTEXTURE", Napi::FunctionPointer::Create(env, &NativeEngine::SetTexture)),
+                StaticValue("COMMAND_BINDVERTEXARRAY", Napi::FunctionPointer::Create(env, &NativeEngine::BindVertexArray)),
+                StaticValue("COMMAND_SETSTATE", Napi::FunctionPointer::Create(env, &NativeEngine::SetState)),
+                StaticValue("COMMAND_SETZOFFSET", Napi::FunctionPointer::Create(env, &NativeEngine::SetZOffset)),
+                StaticValue("COMMAND_SETZOFFSETUNITS", Napi::FunctionPointer::Create(env, &NativeEngine::SetZOffsetUnits)),
+                StaticValue("COMMAND_SETDEPTHTEST", Napi::FunctionPointer::Create(env, &NativeEngine::SetDepthTest)),
+                StaticValue("COMMAND_SETDEPTHWRITE", Napi::FunctionPointer::Create(env, &NativeEngine::SetDepthWrite)),
+                StaticValue("COMMAND_SETCOLORWRITE", Napi::FunctionPointer::Create(env, &NativeEngine::SetColorWrite)),
+                StaticValue("COMMAND_SETBLENDMODE", Napi::FunctionPointer::Create(env, &NativeEngine::SetBlendMode)),
+                StaticValue("COMMAND_SETFLOAT", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloat)),
+                StaticValue("COMMAND_SETFLOAT2", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloat2)),
+                StaticValue("COMMAND_SETFLOAT3", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloat3)),
+                StaticValue("COMMAND_SETFLOAT4", Napi::FunctionPointer::Create(env, &NativeEngine::SetFloat4)),
+                StaticValue("COMMAND_BINDFRAMEBUFFER", Napi::FunctionPointer::Create(env, &NativeEngine::BindFrameBuffer)),
+                StaticValue("COMMAND_UNBINDFRAMEBUFFER", Napi::FunctionPointer::Create(env, &NativeEngine::UnbindFrameBuffer)),
+                StaticValue("COMMAND_DELETEFRAMEBUFFER", Napi::FunctionPointer::Create(env, &NativeEngine::DeleteFrameBuffer)),
+                StaticValue("COMMAND_DRAWINDEXED", Napi::FunctionPointer::Create(env, &NativeEngine::DrawIndexed)),
+                StaticValue("COMMAND_DRAW", Napi::FunctionPointer::Create(env, &NativeEngine::Draw)),
+                StaticValue("COMMAND_CLEAR", Napi::FunctionPointer::Create(env, &NativeEngine::Clear)),
+                StaticValue("COMMAND_SETSTENCIL", Napi::FunctionPointer::Create(env, &NativeEngine::SetStencil)),
+
                 InstanceMethod("dispose", &NativeEngine::Dispose),
-                InstanceMethod("getEngine", &NativeEngine::GetEngine),
+
                 InstanceMethod("requestAnimationFrame", &NativeEngine::RequestAnimationFrame),
+
                 InstanceMethod("createVertexArray", &NativeEngine::CreateVertexArray),
-                InstanceMethod("deleteVertexArray", &NativeEngine::DeleteVertexArray),
-                InstanceMethod("bindVertexArray", &NativeEngine::BindVertexArray),
+
                 InstanceMethod("createIndexBuffer", &NativeEngine::CreateIndexBuffer),
-                InstanceMethod("deleteIndexBuffer", &NativeEngine::DeleteIndexBuffer),
                 InstanceMethod("recordIndexBuffer", &NativeEngine::RecordIndexBuffer),
                 InstanceMethod("updateDynamicIndexBuffer", &NativeEngine::UpdateDynamicIndexBuffer),
+
                 InstanceMethod("createVertexBuffer", &NativeEngine::CreateVertexBuffer),
-                InstanceMethod("deleteVertexBuffer", &NativeEngine::DeleteVertexBuffer),
                 InstanceMethod("recordVertexBuffer", &NativeEngine::RecordVertexBuffer),
                 InstanceMethod("updateDynamicVertexBuffer", &NativeEngine::UpdateDynamicVertexBuffer),
+
                 InstanceMethod("createProgram", &NativeEngine::CreateProgram),
                 InstanceMethod("getUniforms", &NativeEngine::GetUniforms),
                 InstanceMethod("getAttributes", &NativeEngine::GetAttributes),
-                InstanceMethod("setProgram", &NativeEngine::SetProgram),
-                InstanceMethod("setState", &NativeEngine::SetState),
-                InstanceMethod("setZOffset", &NativeEngine::SetZOffset),
-                InstanceMethod("getZOffset", &NativeEngine::GetZOffset),
-                InstanceMethod("setDepthTest", &NativeEngine::SetDepthTest),
-                InstanceMethod("getDepthWrite", &NativeEngine::GetDepthWrite),
-                InstanceMethod("setDepthWrite", &NativeEngine::SetDepthWrite),
-                InstanceMethod("setColorWrite", &NativeEngine::SetColorWrite),
-                InstanceMethod("setBlendMode", &NativeEngine::SetBlendMode),
-                InstanceMethod("setMatrix", &NativeEngine::SetMatrix),
-                InstanceMethod("setInt", &NativeEngine::SetInt),
-                InstanceMethod("setIntArray", &NativeEngine::SetIntArray),
-                InstanceMethod("setIntArray2", &NativeEngine::SetIntArray2),
-                InstanceMethod("setIntArray3", &NativeEngine::SetIntArray3),
-                InstanceMethod("setIntArray4", &NativeEngine::SetIntArray4),
-                InstanceMethod("setFloatArray", &NativeEngine::SetFloatArray),
-                InstanceMethod("setFloatArray2", &NativeEngine::SetFloatArray2),
-                InstanceMethod("setFloatArray3", &NativeEngine::SetFloatArray3),
-                InstanceMethod("setFloatArray4", &NativeEngine::SetFloatArray4),
-                InstanceMethod("setMatrices", &NativeEngine::SetMatrices),
-                InstanceMethod("setMatrix3x3", &NativeEngine::SetMatrix3x3),
-                InstanceMethod("setMatrix2x2", &NativeEngine::SetMatrix2x2),
-                InstanceMethod("setFloat", &NativeEngine::SetFloat),
-                InstanceMethod("setFloat2", &NativeEngine::SetFloat2),
-                InstanceMethod("setFloat3", &NativeEngine::SetFloat3),
-                InstanceMethod("setFloat4", &NativeEngine::SetFloat4),
+
                 InstanceMethod("createTexture", &NativeEngine::CreateTexture),
                 InstanceMethod("loadTexture", &NativeEngine::LoadTexture),
+                InstanceMethod("loadRawTexture", &NativeEngine::LoadRawTexture),
+                InstanceMethod("loadRawTexture2DArray", &NativeEngine::LoadRawTexture2DArray),
                 InstanceMethod("loadCubeTexture", &NativeEngine::LoadCubeTexture),
                 InstanceMethod("loadCubeTextureWithMips", &NativeEngine::LoadCubeTextureWithMips),
                 InstanceMethod("getTextureWidth", &NativeEngine::GetTextureWidth),
                 InstanceMethod("getTextureHeight", &NativeEngine::GetTextureHeight),
-                InstanceMethod("setTextureSampling", &NativeEngine::SetTextureSampling),
-                InstanceMethod("setTextureWrapMode", &NativeEngine::SetTextureWrapMode),
-                InstanceMethod("setTextureAnisotropicLevel", &NativeEngine::SetTextureAnisotropicLevel),
-                InstanceMethod("setTexture", &NativeEngine::SetTexture),
+                InstanceMethod("copyTexture", &NativeEngine::CopyTexture),
                 InstanceMethod("deleteTexture", &NativeEngine::DeleteTexture),
-                InstanceMethod("createFramebuffer", &NativeEngine::CreateFrameBuffer),
-                InstanceMethod("deleteFramebuffer", &NativeEngine::DeleteFrameBuffer),
-                InstanceMethod("bindFramebuffer", &NativeEngine::BindFrameBuffer),
-                InstanceMethod("unbindFramebuffer", &NativeEngine::UnbindFrameBuffer),
-                InstanceMethod("drawIndexed", &NativeEngine::DrawIndexed),
-                InstanceMethod("draw", &NativeEngine::Draw),
-                InstanceMethod("clear", &NativeEngine::Clear),
-                InstanceMethod("clearColor", &NativeEngine::ClearColor),
-                InstanceMethod("clearDepth", &NativeEngine::ClearDepth),
-                InstanceMethod("clearStencil", &NativeEngine::ClearStencil),
+
+                InstanceMethod("createImageBitmap", &NativeEngine::CreateImageBitmap),
+                InstanceMethod("resizeImageBitmap", &NativeEngine::ResizeImageBitmap),
+
+                InstanceMethod("createFrameBuffer", &NativeEngine::CreateFrameBuffer),
+
                 InstanceMethod("getRenderWidth", &NativeEngine::GetRenderWidth),
                 InstanceMethod("getRenderHeight", &NativeEngine::GetRenderHeight),
-                InstanceMethod("setViewPort", &NativeEngine::SetViewPort),
-                InstanceMethod("getFramebufferData", &NativeEngine::GetFramebufferData),
-                InstanceMethod("getRenderAPI", &NativeEngine::GetRenderAPI),
-            });
+                InstanceMethod("getHardwareScalingLevel", &NativeEngine::GetHardwareScalingLevel),
+                InstanceMethod("setHardwareScalingLevel", &NativeEngine::SetHardwareScalingLevel),
 
-        env.Global().Get(JsRuntime::JS_NATIVE_NAME).As<Napi::Object>().Set(JS_ENGINE_CONSTRUCTOR_NAME, func);
+                InstanceMethod("setViewPort", &NativeEngine::SetViewPort),
+
+                InstanceMethod("setCommandDataStream", &NativeEngine::SetCommandDataStream),
+                InstanceMethod("submitCommands", &NativeEngine::SubmitCommands),
+
+                // REVIEW: Should this be here if only used by ValidationTest?
+                InstanceMethod("getFrameBufferData", &NativeEngine::GetFrameBufferData),
+            });
+        // clang-format on
+
+        JsRuntime::NativeObject::GetFromJavaScript(env).Set(JS_CONSTRUCTOR_NAME, func);
     }
 
     NativeEngine::NativeEngine(const Napi::CallbackInfo& info)
-        : NativeEngine(info, Plugins::Internal::NativeWindow::GetFromJavaScript(info.Env()))
+        : NativeEngine(info, JsRuntime::GetFromJavaScript(info.Env()))
     {
     }
 
-    NativeEngine::NativeEngine(const Napi::CallbackInfo& info, Plugins::Internal::NativeWindow& nativeWindow)
+    NativeEngine::NativeEngine(const Napi::CallbackInfo& info, JsRuntime& runtime)
         : Napi::ObjectWrap<NativeEngine>{info}
-        , m_runtime{JsRuntime::GetFromJavaScript(info.Env())}
-        , m_runtimeScheduler{m_runtime}
-        , m_engineState{BGFX_STATE_DEFAULT}
-        , m_resizeCallbackTicket{nativeWindow.AddOnResizeCallback([this](size_t width, size_t height) { this->UpdateSize(width, height); })}
+        , m_cancellationSource{std::make_shared<arcana::cancellation_source>()}
+        , m_runtime{runtime}
+        , m_graphicsImpl{GraphicsImpl::GetFromJavaScript(info.Env())}
+        , m_update{m_graphicsImpl.GetUpdate("update")}
+        , m_runtimeScheduler{runtime}
+        , m_defaultFrameBuffer{m_graphicsImpl, BGFX_INVALID_HANDLE, 0, 0, true, true, true}
+        , m_boundFrameBuffer{&m_defaultFrameBuffer}
+        , m_boundFrameBufferNeedsRebinding{m_graphicsImpl, *m_cancellationSource, true}
     {
-        UpdateSize(static_cast<uint32_t>(nativeWindow.GetWidth()), static_cast<uint32_t>(nativeWindow.GetHeight()));
     }
 
     NativeEngine::~NativeEngine()
@@ -688,35 +524,9 @@ namespace Babylon
         Dispose();
     }
 
-    void NativeEngine::UpdateSize(size_t width, size_t height)
-    {
-        const auto w = static_cast<uint16_t>(width);
-        const auto h = static_cast<uint16_t>(height);
-
-        auto bgfxStats = bgfx::getStats();
-        if (w != bgfxStats->width || h != bgfxStats->height)
-        {
-            bgfx::reset(w, h, BGFX_RESET_FLAGS);
-            bgfx::setViewRect(0, 0, 0, w, h);
-#ifdef __APPLE__
-            bgfx::frame();
-#else
-            bgfx::touch(0);
-#endif
-        }
-    }
-
-    FrameBufferManager& NativeEngine::GetFrameBufferManager()
-    {
-        return m_frameBufferManager;
-    }
-
     void NativeEngine::Dispose()
     {
-        m_cancelSource.cancel();
-
-        // This collection contains bgfx data, so it must be cleared before bgfx::shutdown is called.
-        m_programDataCollection.clear();
+        m_cancellationSource->cancel();
     }
 
     void NativeEngine::Dispose(const Napi::CallbackInfo& /*info*/)
@@ -724,297 +534,240 @@ namespace Babylon
         Dispose();
     }
 
-    // NativeEngine definitions
-    Napi::Value NativeEngine::GetEngine(const Napi::CallbackInfo& info)
-    {
-        return Napi::External<NativeEngine>::New(info.Env(), this);
-    }
-
     void NativeEngine::RequestAnimationFrame(const Napi::CallbackInfo& info)
     {
-        auto callback = info[0].As<Napi::Function>();
+        auto callback{info[0].As<Napi::Function>()};
 
-        if (m_requestAnimationFrameCalback.IsEmpty() ||
-            m_requestAnimationFrameCalback.Value() != callback)
-        {
-            m_requestAnimationFrameCalback = Napi::Persistent(callback);
-        }
-
-        m_runtime.Dispatch([this](Napi::Env env) {
-            try
-            {
-                m_requestAnimationFrameCalback.Call({});
-                EndFrame();
-            }
-            catch (const std::exception& ex)
-            {
-                Napi::Error::New(env, ex.what()).ThrowAsJavaScriptException();
-            }
-        });
+        m_requestAnimationFrameCallbacks.emplace_back(Napi::Persistent(callback));
+        ScheduleRequestAnimationFrameCallbacks();
     }
 
     Napi::Value NativeEngine::CreateVertexArray(const Napi::CallbackInfo& info)
     {
-        return Napi::External<VertexArray>::New(info.Env(), new VertexArray{});
+        VertexArray* vertexArray = new VertexArray{};
+        return Napi::Pointer<VertexArray>::Create(info.Env(), vertexArray, Napi::NapiPointerDeleter(vertexArray));
     }
 
-    void NativeEngine::DeleteVertexArray(const Napi::CallbackInfo& info)
+    void NativeEngine::DeleteVertexArray(NativeDataStream::Reader& data)
     {
-        delete info[0].As<Napi::External<VertexArray>>().Data();
+        data.ReadPointer<VertexArray>()->Dispose();
+        // TODO: should we clear the m_boundVertexArray if it gets deleted?
+        //assert(vertexArray != m_boundVertexArray);
     }
 
-    void NativeEngine::BindVertexArray(const Napi::CallbackInfo& info)
+    void NativeEngine::BindVertexArray(NativeDataStream::Reader& data)
     {
-        const auto& vertexArray = *(info[0].As<Napi::External<VertexArray>>().Data());
-
-        vertexArray.indexBuffer.data->SetBgfxIndexBuffer();
-
-        const auto& vertexBuffers = vertexArray.vertexBuffers;
-        for (uint8_t index = 0; index < vertexBuffers.size(); ++index)
-        {
-            const auto& vertexBuffer = vertexBuffers[index];
-            vertexBuffer.data->SetAsBgfxVertexBuffer(index, vertexBuffer.startVertex, vertexBuffer.vertexLayoutHandle);
-        }
+        m_boundVertexArray = data.ReadPointer<VertexArray>();
     }
 
     Napi::Value NativeEngine::CreateIndexBuffer(const Napi::CallbackInfo& info)
     {
-        const Napi::TypedArray data = info[0].As<Napi::TypedArray>();
-        const bool dynamic = info[1].As<Napi::Boolean>().Value();
+        const Napi::ArrayBuffer bytes = info[0].As<Napi::ArrayBuffer>();
+        const uint32_t byteOffset = info[1].As<Napi::Number>().Uint32Value();
+        const uint32_t byteLength = info[2].As<Napi::Number>().Uint32Value();
+        const bool is32Bits = info[3].As<Napi::Boolean>().Value();
+        const bool dynamic = info[4].As<Napi::Boolean>().Value();
 
-        const uint16_t flags = data.TypedArrayType() == napi_typedarray_type::napi_uint16_array ? 0 : BGFX_BUFFER_INDEX32;
-
-        return Napi::External<IndexBufferData>::New(info.Env(), new IndexBufferData(data, flags, dynamic));
+        const uint16_t flags = (is32Bits ? BGFX_BUFFER_INDEX32 : 0);
+        IndexBuffer* indexBuffer = new IndexBuffer{gsl::make_span(static_cast<uint8_t*>(bytes.Data()) + byteOffset, byteLength), flags, dynamic};
+        return Napi::Pointer<IndexBuffer>::Create(info.Env(), indexBuffer, Napi::NapiPointerDeleter(indexBuffer));
     }
 
-    void NativeEngine::DeleteIndexBuffer(const Napi::CallbackInfo& info)
+    void NativeEngine::DeleteIndexBuffer(NativeDataStream::Reader& data)
     {
-        IndexBufferData* indexBufferData = info[0].As<Napi::External<IndexBufferData>>().Data();
-        delete indexBufferData;
+        data.ReadPointer<IndexBuffer>()->Dispose();
     }
 
     void NativeEngine::RecordIndexBuffer(const Napi::CallbackInfo& info)
     {
-        VertexArray& vertexArray = *(info[0].As<Napi::External<VertexArray>>().Data());
-        const IndexBufferData* indexBufferData = info[1].As<Napi::External<IndexBufferData>>().Data();
+        VertexArray* vertexArray = info[0].As<Napi::Pointer<VertexArray>>().Get();
+        IndexBuffer* indexBuffer = info[1].As<Napi::Pointer<IndexBuffer>>().Get();
 
-        vertexArray.indexBuffer.data = indexBufferData;
+        if (!vertexArray->RecordIndexBuffer(indexBuffer))
+        {
+            JsConsoleLogger::LogWarn(info.Env(), "WARNING: Fail to create index buffer. Number of index buffers higher than max count.");
+        }
     }
 
     void NativeEngine::UpdateDynamicIndexBuffer(const Napi::CallbackInfo& info)
     {
-        IndexBufferData& indexBufferData = *(info[0].As<Napi::External<IndexBufferData>>().Data());
+        IndexBuffer* indexBuffer = info[0].As<Napi::Pointer<IndexBuffer>>().Get();
+        const Napi::ArrayBuffer bytes = info[1].As<Napi::ArrayBuffer>();
+        const uint32_t byteOffset = info[2].As<Napi::Number>().Uint32Value();
+        const uint32_t byteLength = info[3].As<Napi::Number>().Uint32Value();
+        const uint32_t startingIndex = info[4].As<Napi::Number>().Uint32Value();
 
-        const Napi::TypedArray data = info[1].As<Napi::TypedArray>();
-        const uint32_t startingIdx = info[2].As<Napi::Number>().Uint32Value();
-
-        indexBufferData.Update(data, startingIdx);
+        indexBuffer->Update(info.Env(), gsl::make_span(static_cast<uint8_t*>(bytes.Data()) + byteOffset, byteLength), startingIndex);
     }
 
     Napi::Value NativeEngine::CreateVertexBuffer(const Napi::CallbackInfo& info)
     {
-        const Napi::Uint8Array data = info[0].As<Napi::Uint8Array>();
-        const bool dynamic = info[1].As<Napi::Boolean>().Value();
+        const Napi::ArrayBuffer bytes = info[0].As<Napi::ArrayBuffer>();
+        const uint32_t byteOffset = info[1].As<Napi::Number>().Uint32Value();
+        const uint32_t byteLength = info[2].As<Napi::Number>().Uint32Value();
+        const bool dynamic = info[3].As<Napi::Boolean>().Value();
 
-        return Napi::External<VertexBufferData>::New(info.Env(), new VertexBufferData(data, dynamic));
+        VertexBuffer* vertexBuffer = new VertexBuffer(gsl::make_span(static_cast<uint8_t*>(bytes.Data()) + byteOffset, byteLength), dynamic);
+        return Napi::Pointer<VertexBuffer>::Create(info.Env(), vertexBuffer, Napi::NapiPointerDeleter(vertexBuffer));
     }
 
-    void NativeEngine::DeleteVertexBuffer(const Napi::CallbackInfo& info)
+    void NativeEngine::DeleteVertexBuffer(NativeDataStream::Reader& data)
     {
-        auto* vertexBufferData = info[0].As<Napi::External<VertexBufferData>>().Data();
-        delete vertexBufferData;
+        data.ReadPointer<VertexBuffer>()->Dispose();
     }
 
     void NativeEngine::RecordVertexBuffer(const Napi::CallbackInfo& info)
     {
-        VertexArray& vertexArray = *(info[0].As<Napi::External<VertexArray>>().Data());
-        VertexBufferData* vertexBufferData = info[1].As<Napi::External<VertexBufferData>>().Data();
-
+        VertexArray* vertexArray = info[0].As<Napi::Pointer<VertexArray>>().Get();
+        VertexBuffer* vertexBuffer = info[1].As<Napi::Pointer<VertexBuffer>>().Get();
         const uint32_t location = info[2].As<Napi::Number>().Uint32Value();
         const uint32_t byteOffset = info[3].As<Napi::Number>().Uint32Value();
         const uint32_t byteStride = info[4].As<Napi::Number>().Uint32Value();
         const uint32_t numElements = info[5].As<Napi::Number>().Uint32Value();
         const uint32_t type = info[6].As<Napi::Number>().Uint32Value();
         const bool normalized = info[7].As<Napi::Boolean>().Value();
+        const uint32_t divisor = info[8].As<Napi::Number>().Uint32Value();
 
-        bgfx::VertexLayout vertexLayout{};
-        vertexLayout.begin();
-        const bgfx::Attrib::Enum attrib = static_cast<bgfx::Attrib::Enum>(location);
-        const bgfx::AttribType::Enum attribType = ConvertAttribType(static_cast<WebGLAttribType>(type));
-        vertexLayout.add(attrib, static_cast<uint8_t>(numElements), attribType, normalized);
-        vertexLayout.m_stride = static_cast<uint16_t>(byteStride);
-        vertexLayout.end();
-
-        vertexBufferData->EnsureFinalized(info.Env(), vertexLayout);
-
-        vertexArray.vertexBuffers.push_back({vertexBufferData, byteOffset / byteStride, bgfx::createVertexLayout(vertexLayout)});
+        if (!vertexArray->RecordVertexBuffer(vertexBuffer, location, byteOffset, byteStride, numElements, type, normalized, divisor))
+        {
+            JsConsoleLogger::LogWarn(info.Env(), "WARNING: Fail to create vertex buffer. Number of vertex buffers higher than max count or too many instanced streams.");
+        }
     }
 
     void NativeEngine::UpdateDynamicVertexBuffer(const Napi::CallbackInfo& info)
     {
-        VertexBufferData& vertexBufferData = *(info[0].As<Napi::External<VertexBufferData>>().Data());
-        const Napi::Uint8Array data = info[1].As<Napi::Uint8Array>();
+        VertexBuffer* vertexBuffer = info[0].As<Napi::Pointer<VertexBuffer>>().Get();
+        const Napi::ArrayBuffer bytes = info[1].As<Napi::ArrayBuffer>();
         const uint32_t byteOffset = info[2].As<Napi::Number>().Uint32Value();
+        const uint32_t byteLength = info[3].As<Napi::Number>().Uint32Value();
 
-        uint32_t byteLength = info[2].As<Napi::Number>().Uint32Value();
-        if (byteLength == 0)
+        vertexBuffer->Update(info.Env(), gsl::make_span(static_cast<uint8_t*>(bytes.Data()) + byteOffset, byteLength));
+    }
+
+    // Change VS output coordinate system
+    std::string NativeEngine::ProcessShaderCoordinates(const std::string& vertexSource)
+    {
+        const auto* caps = bgfx::getCaps();
+        // patching shader code to append clip space coordinates for the current rendering API
+        // Can be done with glslang shader traversal. Done with string patching for now.
+        if (!caps->homogeneousDepth)
         {
-            byteLength = static_cast<uint32_t>(data.ByteLength());
-        }
+            std::string patchedVertexSource;
+            const auto lastClosingCurly = vertexSource.find_last_of('}');
+            patchedVertexSource = vertexSource.substr(0, lastClosingCurly);
 
-        vertexBufferData.Update(data, byteOffset, byteLength);
+            patchedVertexSource += "gl_Position.z = (gl_Position.z + gl_Position.w) / 2.0; }";
+            return patchedVertexSource;
+        }
+        return vertexSource;
+    }
+
+    std::string ProcessSamplerFlip(const std::string& vertexSource)
+    {
+        const auto* caps = bgfx::getCaps();
+        // for d3d, vulkan, metal, flip the texture sampling on vertical axis
+        if (!caps->originBottomLeft)
+        {
+            std::string patchedVertexSource = vertexSource;
+
+            static const std::string shaderNameDefineStr = "#define SHADER_NAME";
+            const auto shaderNameDefine = vertexSource.find(shaderNameDefineStr);
+            if (shaderNameDefine != std::string::npos)
+            {
+                static const auto textureSamplerFunctions = R"(
+                    highp vec2 flip(highp vec2 uv)
+                    {
+                        return vec2(uv.x, 1. - uv.y);
+                    }
+                    highp vec3 flip(highp vec3 uv)
+                    {
+                        return uv;
+                    }
+                    #define texture(x,y) texture(x, flip(y))
+                    #define SHADER_NAME)";
+
+                patchedVertexSource.replace(shaderNameDefine, shaderNameDefineStr.length(), textureSamplerFunctions);
+            }
+            return patchedVertexSource;
+        }
+        return vertexSource;
     }
 
     Napi::Value NativeEngine::CreateProgram(const Napi::CallbackInfo& info)
     {
-        const auto vertexSource = info[0].As<Napi::String>().Utf8Value();
-        const auto fragmentSource = info[1].As<Napi::String>().Utf8Value();
+        const std::string vertexSource = info[0].As<Napi::String>().Utf8Value();
+        const std::string fragmentSource = info[1].As<Napi::String>().Utf8Value();
 
-        auto programData = std::make_unique<ProgramData>();
+        ProgramData* program = new ProgramData{};
+        ShaderCompiler::BgfxShaderInfo shaderInfo{};
 
-        std::vector<uint8_t> vertexBytes{};
-        std::vector<uint8_t> fragmentBytes{};
-        std::unordered_map<std::string, uint32_t> attributeLocations;
+        try
+        {
+            shaderInfo = m_shaderCompiler.Compile(ProcessShaderCoordinates(vertexSource), ProcessSamplerFlip(fragmentSource));
+        }
+        catch (const std::exception& ex)
+        {
+            throw Napi::Error::New(info.Env(), ex.what());
+        }
 
-        m_shaderCompiler.Compile(vertexSource, fragmentSource, [&](ShaderCompiler::ShaderInfo vertexShaderInfo, ShaderCompiler::ShaderInfo fragmentShaderInfo) {
-            constexpr uint8_t BGFX_SHADER_BIN_VERSION = 6;
-
-            // These hashes are generated internally by BGFX's custom shader compilation pipeline,
-            // which we don't have access to.  Fortunately, however, they aren't used for anything
-            // crucial; they just have to match.
-            constexpr uint32_t vertexOutputsHash = 0xBAD1DEA;
-            constexpr uint32_t fragmentInputsHash = vertexOutputsHash;
-
+        static auto InitUniformInfos{
+            [](bgfx::ShaderHandle shader, const std::unordered_map<std::string, uint8_t>& uniformStages, std::unordered_map<uint16_t, UniformInfo>& uniformInfos, std::unordered_map<std::string, uint16_t>& uniformNameToIndex)
             {
-                const auto& compiler = *vertexShaderInfo.Compiler;
-                const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
-                auto uniformsInfo = CollectNonSamplerUniforms(*vertexShaderInfo.Parser, compiler);
-#if (BGFX_CONFIG_RENDERER_METAL)
-                // with metal, we bind images and not samplers
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_images;
-#else
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_samplers;
-#endif
-                size_t numUniforms = uniformsInfo.Uniforms.size() + samplers.size();
+                auto numUniforms = bgfx::getShaderUniforms(shader);
+                std::vector<bgfx::UniformHandle> uniforms{numUniforms};
+                bgfx::getShaderUniforms(shader, uniforms.data(), gsl::narrow_cast<uint16_t>(uniforms.size()));
 
-                AppendBytes(vertexBytes, BX_MAKEFOURCC('V', 'S', 'H', BGFX_SHADER_BIN_VERSION));
-                AppendBytes(vertexBytes, vertexOutputsHash);
-                AppendBytes(vertexBytes, fragmentInputsHash);
-
-                AppendBytes(vertexBytes, static_cast<uint16_t>(numUniforms));
-                AppendUniformBuffer(vertexBytes, uniformsInfo, false);
-                AppendSamplers(vertexBytes, compiler, samplers, false, programData->VertexUniformNameToInfo);
-
-                AppendBytes(vertexBytes, static_cast<uint32_t>(vertexShaderInfo.Bytes.size()));
-                AppendBytes(vertexBytes, vertexShaderInfo.Bytes);
-                AppendBytes(vertexBytes, static_cast<uint8_t>(0));
-
-                AppendBytes(vertexBytes, static_cast<uint8_t>(resources.stage_inputs.size()));
-                for (const spirv_cross::Resource& stageInput : resources.stage_inputs)
+                for (uint8_t index = 0; index < numUniforms; index++)
                 {
-                    const uint32_t location = compiler.get_decoration(stageInput.id, spv::DecorationLocation);
-                    AppendBytes(vertexBytes, bgfx::attribToId(static_cast<bgfx::Attrib::Enum>(location)));
-
-                    std::string attributeName = stageInput.name;
-                    if (attributeName == "a_position")
-                        attributeName = "position";
-                    else if (attributeName == "a_normal")
-                        attributeName = "normal";
-                    else if (attributeName == "a_tangent")
-                        attributeName = "tangent";
-                    else if (attributeName == "a_texcoord0")
-                        attributeName = "uv";
-                    else if (attributeName == "a_texcoord1")
-                        attributeName = "uv2";
-                    else if (attributeName == "a_texcoord2")
-                        attributeName = "uv3";
-                    else if (attributeName == "a_texcoord3")
-                        attributeName = "uv4";
-                    else if (attributeName == "a_color0")
-                        attributeName = "color";
-                    else if (attributeName == "a_indices")
-                        attributeName = "matricesIndices";
-                    else if (attributeName == "a_weight")
-                        attributeName = "matricesWeights";
-
-                    attributeLocations[attributeName] = location;
+                    bgfx::UniformInfo info{};
+                    uint16_t handleIndex = uniforms[index].idx;
+                    bgfx::getUniformInfo(uniforms[index], info);
+                    auto itStage = uniformStages.find(info.name);
+                    auto& handle = uniforms[index];
+                    uniformInfos.emplace(std::make_pair(handle.idx, UniformInfo{itStage == uniformStages.end() ? uint8_t{} : itStage->second, handle, info.num}));
+                    uniformNameToIndex[info.name] = handleIndex;
                 }
+            }};
 
-                AppendBytes(vertexBytes, static_cast<uint16_t>(uniformsInfo.ByteSize));
-            }
+        auto vertexShader = bgfx::createShader(bgfx::copy(shaderInfo.VertexBytes.data(), static_cast<uint32_t>(shaderInfo.VertexBytes.size())));
+        InitUniformInfos(vertexShader, shaderInfo.UniformStages, program->UniformInfos, program->UniformNameToIndex);
+        program->VertexAttributeLocations = std::move(shaderInfo.VertexAttributeLocations);
 
-            {
-                const spirv_cross::Compiler& compiler = *fragmentShaderInfo.Compiler;
-                const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
-                const auto uniformsInfo = CollectNonSamplerUniforms(*fragmentShaderInfo.Parser, compiler);
-#if __APPLE__
-                // with metal, we bind images and not samplers
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_images;
-#else
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_samplers;
-#endif
-                size_t numUniforms = uniformsInfo.Uniforms.size() + samplers.size();
+        auto fragmentShader = bgfx::createShader(bgfx::copy(shaderInfo.FragmentBytes.data(), static_cast<uint32_t>(shaderInfo.FragmentBytes.size())));
+        InitUniformInfos(fragmentShader, shaderInfo.UniformStages, program->UniformInfos, program->UniformNameToIndex);
 
-                AppendBytes(fragmentBytes, BX_MAKEFOURCC('F', 'S', 'H', BGFX_SHADER_BIN_VERSION));
-                AppendBytes(fragmentBytes, vertexOutputsHash);
-                AppendBytes(fragmentBytes, fragmentInputsHash);
-
-                AppendBytes(fragmentBytes, static_cast<uint16_t>(numUniforms));
-                AppendUniformBuffer(fragmentBytes, uniformsInfo, true);
-                AppendSamplers(fragmentBytes, compiler, samplers, true, programData->FragmentUniformNameToInfo);
-
-                AppendBytes(fragmentBytes, static_cast<uint32_t>(fragmentShaderInfo.Bytes.size()));
-                AppendBytes(fragmentBytes, fragmentShaderInfo.Bytes);
-                AppendBytes(fragmentBytes, static_cast<uint8_t>(0));
-
-                // Fragment shaders don't have attributes.
-                AppendBytes(fragmentBytes, static_cast<uint8_t>(0));
-
-                AppendBytes(fragmentBytes, static_cast<uint16_t>(uniformsInfo.ByteSize));
-            }
-        });
-
-        auto vertexShader = bgfx::createShader(bgfx::copy(vertexBytes.data(), static_cast<uint32_t>(vertexBytes.size())));
-        CacheUniformHandles(vertexShader, programData->VertexUniformNameToInfo);
-        programData->AttributeLocations = std::move(attributeLocations);
-
-        auto fragmentShader = bgfx::createShader(bgfx::copy(fragmentBytes.data(), static_cast<uint32_t>(fragmentBytes.size())));
-        CacheUniformHandles(fragmentShader, programData->FragmentUniformNameToInfo);
-
-        programData->Program = bgfx::createProgram(vertexShader, fragmentShader, true);
-
-        auto* rawProgramData = programData.get();
-        auto ticket = m_programDataCollection.insert(std::move(programData));
-        auto finalizer = [ticket = std::move(ticket)](Napi::Env, ProgramData*) {};
-        return Napi::External<ProgramData>::New(info.Env(), rawProgramData, std::move(finalizer));
+        program->Handle = bgfx::createProgram(vertexShader, fragmentShader, true);
+        return Napi::Pointer<ProgramData>::Create(info.Env(), program, Napi::NapiPointerDeleter(program));
     }
 
     Napi::Value NativeEngine::GetUniforms(const Napi::CallbackInfo& info)
     {
-        const auto program = info[0].As<Napi::External<ProgramData>>().Data();
-        const auto names = info[1].As<Napi::Array>();
+        const ProgramData* program = info[0].As<Napi::Pointer<ProgramData>>().Get();
+        const Napi::Array names = info[1].As<Napi::Array>();
 
-        auto length = names.Length();
-        auto uniforms = Napi::Array::New(info.Env(), length);
+        const auto length{names.Length()};
+        auto uniforms{Napi::Array::New(info.Env(), length)};
         for (uint32_t index = 0; index < length; ++index)
         {
-            const auto name = names[index].As<Napi::String>().Utf8Value();
+            if (names[index].IsString())
+            {
+                const auto name{names[index].As<Napi::String>().Utf8Value()};
 
-            auto vertexFound = program->VertexUniformNameToInfo.find(name);
-            auto fragmentFound = program->FragmentUniformNameToInfo.find(name);
+                const auto itUniformIndex = program->UniformNameToIndex.find(name);
 
-            if (vertexFound != program->VertexUniformNameToInfo.end())
-            {
-                uniforms[index] = Napi::External<UniformInfo>::New(info.Env(), &vertexFound->second);
+                if (itUniformIndex != program->UniformNameToIndex.end())
+                {
+                    const auto itUniformInfo{program->UniformInfos.find(itUniformIndex->second)};
+
+                    if (itUniformInfo != program->UniformInfos.end())
+                    {
+                        uniforms[index] = Napi::Pointer<UniformInfo>::Create(info.Env(), &itUniformInfo->second);
+                        continue;
+                    }
+                }
             }
-            else if (fragmentFound != program->FragmentUniformNameToInfo.end())
-            {
-                uniforms[index] = Napi::External<UniformInfo>::New(info.Env(), &fragmentFound->second);
-            }
-            else
-            {
-                uniforms[index] = info.Env().Null();
-            }
+
+            uniforms[index] = info.Env().Null();
         }
 
         return std::move(uniforms);
@@ -1022,16 +775,16 @@ namespace Babylon
 
     Napi::Value NativeEngine::GetAttributes(const Napi::CallbackInfo& info)
     {
-        const auto program = info[0].As<Napi::External<ProgramData>>().Data();
-        const auto names = info[1].As<Napi::Array>();
+        const ProgramData* program = info[0].As<Napi::Pointer<ProgramData>>().Get();
+        const Napi::Array names = info[1].As<Napi::Array>();
 
-        const auto& attributeLocations = program->AttributeLocations;
+        const auto& attributeLocations = program->VertexAttributeLocations;
 
         auto length = names.Length();
         auto attributes = Napi::Array::New(info.Env(), length);
         for (uint32_t index = 0; index < length; ++index)
         {
-            const auto name = names[index].As<Napi::String>().Utf8Value();
+            const std::string name = names[index].As<Napi::String>().Utf8Value();
             const auto it = attributeLocations.find(name);
             int location = (it == attributeLocations.end() ? -1 : gsl::narrow_cast<int>(it->second));
             attributes[index] = Napi::Value::From(info.Env(), location);
@@ -1040,108 +793,92 @@ namespace Babylon
         return std::move(attributes);
     }
 
-    void NativeEngine::SetProgram(const Napi::CallbackInfo& info)
+    void NativeEngine::SetProgram(NativeDataStream::Reader& data)
     {
-        auto program = info[0].As<Napi::External<ProgramData>>().Data();
-        m_currentProgram = program;
+        m_currentProgram = data.ReadPointer<ProgramData>();
     }
 
-    void NativeEngine::SetState(const Napi::CallbackInfo& info)
+    void NativeEngine::SetState(NativeDataStream::Reader& data)
     {
-        const auto culling = info[0].As<Napi::Boolean>().Value();
-        const auto reverseSide = info[2].As<Napi::Boolean>().Value();
-
-        m_engineState &= ~BGFX_STATE_CULL_MASK;
-        if (reverseSide)
-        {
-            m_engineState &= ~BGFX_STATE_FRONT_CCW;
-
-            if (culling)
-            {
-                m_engineState |= BGFX_STATE_CULL_CW;
-            }
-        }
-        else
-        {
-            m_engineState |= BGFX_STATE_FRONT_CCW;
-
-            if (culling)
-            {
-                m_engineState |= BGFX_STATE_CULL_CCW;
-            }
-        }
-
+        const bool culling = data.ReadUint32();
         // TODO: zOffset
-        //const auto zOffset = info[1].As<Napi::Number>().FloatValue();
+        /*const float zOffset =*/ data.ReadFloat32();
+        /*const float zOffsetUnits =*/ data.ReadFloat32();
+        const bool cullBackFaces = data.ReadUint32();
+        const bool reverseSide = data.ReadUint32();
+
+        m_engineState &= ~(BGFX_STATE_CULL_MASK | BGFX_STATE_FRONT_CCW);
+        m_engineState |= reverseSide ? 0 : BGFX_STATE_FRONT_CCW;
+
+        if (culling)
+        {
+            m_engineState |= cullBackFaces ? BGFX_STATE_CULL_CCW : BGFX_STATE_CULL_CW;
+        }
     }
 
-    void NativeEngine::SetZOffset(const Napi::CallbackInfo& /*info*/)
+    void NativeEngine::DeleteProgram(NativeDataStream::Reader& data)
     {
-        //const auto zOffset = info[0].As<Napi::Number>().FloatValue();
+        data.ReadPointer<ProgramData>()->Dispose();
+    }
+
+    void NativeEngine::SetZOffset(NativeDataStream::Reader& data)
+    {
+        /*const auto zOffset =*/ data.ReadFloat32();
 
         // STUB: Stub.
     }
 
-    Napi::Value NativeEngine::GetZOffset(const Napi::CallbackInfo& /*info*/)
+    void NativeEngine::SetZOffsetUnits(NativeDataStream::Reader& data)
     {
+        /*const auto zOffsetUnits =*/ data.ReadFloat32();
+
         // STUB: Stub.
-        return {};
     }
 
-    void NativeEngine::SetDepthTest(const Napi::CallbackInfo& info)
+    void NativeEngine::SetDepthTest(NativeDataStream::Reader& data)
     {
-        const auto enable = info[0].As<Napi::Boolean>().Value();
+        const auto depthTest = data.ReadUint32();
 
         m_engineState &= ~BGFX_STATE_DEPTH_TEST_MASK;
-        m_engineState |= enable ? BGFX_STATE_DEPTH_TEST_LESS : BGFX_STATE_DEPTH_TEST_ALWAYS;
+        m_engineState |= depthTest;
     }
 
-    Napi::Value NativeEngine::GetDepthWrite(const Napi::CallbackInfo& info)
+    void NativeEngine::SetDepthWrite(NativeDataStream::Reader& data)
     {
-        return Napi::Value::From(info.Env(), !!(m_engineState & BGFX_STATE_WRITE_Z));
-    }
-
-    void NativeEngine::SetDepthWrite(const Napi::CallbackInfo& info)
-    {
-        const auto enable = info[0].As<Napi::Boolean>().Value();
+        const auto enable = static_cast<bool>(data.ReadUint32());
 
         m_engineState &= ~BGFX_STATE_WRITE_Z;
         m_engineState |= enable ? BGFX_STATE_WRITE_Z : 0;
     }
 
-    void NativeEngine::SetColorWrite(const Napi::CallbackInfo& info)
+    void NativeEngine::SetColorWrite(NativeDataStream::Reader& data)
     {
-        const auto enable = info[0].As<Napi::Boolean>().Value();
+        const auto enable = static_cast<bool>(data.ReadUint32());
 
         m_engineState &= ~(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
         m_engineState |= enable ? (BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A) : 0;
     }
 
-    void NativeEngine::SetBlendMode(const Napi::CallbackInfo& info)
+    void NativeEngine::SetBlendMode(NativeDataStream::Reader& data)
     {
-        const auto blendMode = info[0].As<Napi::Number>().Int32Value();
+        const auto blendMode = data.ReadUint32();
 
         m_engineState &= ~BGFX_STATE_BLEND_MASK;
-        m_engineState |= ALPHA_MODE[blendMode];
+        m_engineState |= blendMode;
     }
-
-    void NativeEngine::SetInt(const Napi::CallbackInfo& info)
+    
+    void NativeEngine::SetInt(NativeDataStream::Reader& data)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
-        const auto value = info[1].As<Napi::Number>().FloatValue();
-        m_currentProgram->SetUniform(uniformData->Handle, gsl::make_span(&value, 1));
+        const auto& uniformInfo{*data.ReadPointer<UniformInfo>()};
+        const auto value{static_cast<float>(data.ReadInt32())};
+        m_currentProgram->SetUniform(uniformInfo.Handle, gsl::make_span(&value, 1));
     }
 
     template<int size, typename arrayType>
-    void NativeEngine::SetTypeArrayN(const Napi::CallbackInfo& info)
+    void NativeEngine::SetTypeArrayN(const UniformInfo& uniformInfo, const uint32_t elementLength, const arrayType& array)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
-        const auto array = info[1].As<arrayType>();
-
-        size_t elementLength = array.ElementLength();
-
         m_scratch.clear();
-        for (size_t index = 0; index < elementLength; index += size)
+        for (uint32_t index = 0; index < elementLength; index += size)
         {
             const float values[] = {
                 static_cast<float>(array[index]),
@@ -1152,36 +889,34 @@ namespace Babylon
             m_scratch.insert(m_scratch.end(), values, values + 4);
         }
 
-        m_currentProgram->SetUniform(uniformData->Handle, m_scratch, elementLength / size);
+        m_currentProgram->SetUniform(uniformInfo.Handle, m_scratch, elementLength / size);
     }
 
     template<int size>
-    void NativeEngine::SetFloatN(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloatN(NativeDataStream::Reader& data)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
+        const auto& uniformInfo = *data.ReadPointer<UniformInfo>();
         const float values[] = {
-            info[1].As<Napi::Number>().FloatValue(),
-            (size > 1) ? info[2].As<Napi::Number>().FloatValue() : 0.f,
-            (size > 2) ? info[3].As<Napi::Number>().FloatValue() : 0.f,
-            (size > 3) ? info[4].As<Napi::Number>().FloatValue() : 0.f,
+            data.ReadFloat32(),
+            (size > 1) ? data.ReadFloat32() : 0.f,
+            (size > 2) ? data.ReadFloat32() : 0.f,
+            (size > 3) ? data.ReadFloat32() : 0.f,
         };
 
-        m_currentProgram->SetUniform(uniformData->Handle, values);
+        m_currentProgram->SetUniform(uniformInfo.Handle, values);
     }
 
     template<int size>
-    void NativeEngine::SetMatrixN(const Napi::CallbackInfo& info)
+    void NativeEngine::SetMatrixN(NativeDataStream::Reader& data)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
-        const auto matrix = info[1].As<Napi::Float32Array>();
+        const auto& uniformInfo{*data.ReadPointer<UniformInfo>()};
+        const auto matrix{data.ReadFloat32Array()};
 
-        const size_t elementLength = matrix.ElementLength();
-        assert(elementLength == size * size);
+        assert(matrix.size() == size * size);
 
         if constexpr (size < 4)
         {
             std::array<float, 16> matrixValues{};
-
             size_t index = 0;
             for (int line = 0; line < size; line++)
             {
@@ -1190,136 +925,140 @@ namespace Babylon
                     matrixValues[line * 4 + col] = matrix[index++];
                 }
             }
-
-            m_currentProgram->SetUniform(uniformData->Handle, gsl::make_span(matrixValues.data(), 16));
+            m_currentProgram->SetUniform(uniformInfo.Handle, matrixValues);
         }
         else
         {
-            m_currentProgram->SetUniform(uniformData->Handle, gsl::make_span(matrix.Data(), elementLength));
+            m_currentProgram->SetUniform(uniformInfo.Handle, matrix);
         }
     }
 
-    void NativeEngine::SetIntArray(const Napi::CallbackInfo& info)
+    template<int size>
+    void NativeEngine::SetIntArrayN(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<1, Napi::Int32Array>(info);
+        const auto& uniformInfo{*data.ReadPointer<UniformInfo>()};
+        const auto array{data.ReadInt32Array()};
+        SetTypeArrayN<size>(uniformInfo, static_cast<uint32_t>(array.size()), array);
     }
 
-    void NativeEngine::SetIntArray2(const Napi::CallbackInfo& info)
+    void NativeEngine::SetIntArray(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<2, Napi::Int32Array>(info);
+        SetIntArrayN<1>(data);
     }
 
-    void NativeEngine::SetIntArray3(const Napi::CallbackInfo& info)
+    void NativeEngine::SetIntArray2(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<3, Napi::Int32Array>(info);
+        SetIntArrayN<2>(data);
     }
 
-    void NativeEngine::SetIntArray4(const Napi::CallbackInfo& info)
+    void NativeEngine::SetIntArray3(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<4, Napi::Int32Array>(info);
+        SetIntArrayN<3>(data);
     }
 
-    void NativeEngine::SetFloatArray(const Napi::CallbackInfo& info)
+    void NativeEngine::SetIntArray4(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<1, Napi::Float32Array>(info);
+        SetIntArrayN<4>(data);
     }
 
-    void NativeEngine::SetFloatArray2(const Napi::CallbackInfo& info)
+    template<int size>
+    void NativeEngine::SetFloatArrayN(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<2, Napi::Float32Array>(info);
+        const auto& uniformInfo{*data.ReadPointer<UniformInfo>()};
+        const auto array{data.ReadFloat32Array()};
+        SetTypeArrayN<size>(uniformInfo, static_cast<uint32_t>(array.size()), array);
     }
 
-    void NativeEngine::SetFloatArray3(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloatArray(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<3, Napi::Float32Array>(info);
+        SetFloatArrayN<1>(data);
     }
 
-    void NativeEngine::SetFloatArray4(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloatArray2(NativeDataStream::Reader& data)
     {
-        SetTypeArrayN<4, Napi::Float32Array>(info);
+        SetFloatArrayN<2>(data);
     }
 
-    void NativeEngine::SetMatrices(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloatArray3(NativeDataStream::Reader& data)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
-        const auto matricesArray = info[1].As<Napi::Float32Array>();
-
-        const size_t elementLength = matricesArray.ElementLength();
-        assert(elementLength % 16 == 0);
-
-        m_currentProgram->SetUniform(uniformData->Handle, gsl::span(matricesArray.Data(), elementLength), elementLength / 16);
+        SetFloatArrayN<3>(data);
     }
 
-    void NativeEngine::SetMatrix2x2(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloatArray4(NativeDataStream::Reader& data)
     {
-        SetMatrixN<2>(info);
+        SetFloatArrayN<4>(data);
     }
 
-    void NativeEngine::SetMatrix3x3(const Napi::CallbackInfo& info)
+    void NativeEngine::SetMatrices(NativeDataStream::Reader& data)
     {
-        SetMatrixN<3>(info);
+        auto& uniform{*data.ReadPointer<UniformInfo>()};
+        auto matrices{data.ReadFloat32Array()};
+
+        assert(matrices.size() % 16 == 0);
+
+        m_currentProgram->SetUniform(uniform.Handle, matrices, matrices.size() / 16);
     }
 
-    void NativeEngine::SetMatrix(const Napi::CallbackInfo& info)
+    void NativeEngine::SetMatrix2x2(NativeDataStream::Reader& data)
     {
-        SetMatrixN<4>(info);
+        SetMatrixN<2>(data);
     }
 
-    void NativeEngine::SetFloat(const Napi::CallbackInfo& info)
+    void NativeEngine::SetMatrix3x3(NativeDataStream::Reader& data)
     {
-        SetFloatN<1>(info);
+        SetMatrixN<3>(data);
     }
 
-    void NativeEngine::SetFloat2(const Napi::CallbackInfo& info)
+    void NativeEngine::SetMatrix(NativeDataStream::Reader& data)
     {
-        SetFloatN<2>(info);
+        SetMatrixN<4>(data);
     }
 
-    void NativeEngine::SetFloat3(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloat(NativeDataStream::Reader& data)
     {
-        SetFloatN<3>(info);
+        SetFloatN<1>(data);
     }
 
-    void NativeEngine::SetFloat4(const Napi::CallbackInfo& info)
+    void NativeEngine::SetFloat2(NativeDataStream::Reader& data)
     {
-        SetFloatN<4>(info);
+        SetFloatN<2>(data);
+    }
+
+    void NativeEngine::SetFloat3(NativeDataStream::Reader& data)
+    {
+        SetFloatN<3>(data);
+    }
+
+    void NativeEngine::SetFloat4(NativeDataStream::Reader& data)
+    {
+        SetFloatN<4>(data);
     }
 
     Napi::Value NativeEngine::CreateTexture(const Napi::CallbackInfo& info)
     {
-        return Napi::External<TextureData>::New(info.Env(), new TextureData());
+        TextureData* texture = new TextureData();
+        return Napi::Pointer<TextureData>::Create(info.Env(), texture, Napi::NapiPointerDeleter(texture));
     }
 
     void NativeEngine::LoadTexture(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
+        const auto texture = info[0].As<Napi::Pointer<TextureData>>().Get();
         const auto data = info[1].As<Napi::TypedArray>();
         const auto generateMips = info[2].As<Napi::Boolean>().Value();
         const auto invertY = info[3].As<Napi::Boolean>().Value();
-        const auto onSuccess = info[4].As<Napi::Function>();
-        const auto onError = info[5].As<Napi::Function>();
+        const auto srgb = info[4].As<Napi::Boolean>().Value();
+        const auto onSuccess = info[5].As<Napi::Function>();
+        const auto onError = info[6].As<Napi::Function>();
 
         const auto dataSpan = gsl::make_span(static_cast<uint8_t*>(data.ArrayBuffer().Data()) + data.ByteOffset(), data.ByteLength());
 
-        arcana::make_task(arcana::threadpool_scheduler, m_cancelSource,
-            [this, dataSpan, generateMips, invertY]() {
-                bimg::ImageContainer* image = bimg::imageParse(&m_allocator, dataSpan.data(), static_cast<uint32_t>(dataSpan.size()));
-                // todo: bimg::imageParse will return nullptr when trying to load a texture with an url that is not a valid texture
-                // Like a 404 html page.
-                if (invertY)
-                {
-                    FlipY(image);
-                }
-                if (generateMips)
-                {
-                    GenerateMips(&m_allocator, &image);
-                }
-                return image;
+        arcana::make_task(arcana::threadpool_scheduler, *m_cancellationSource,
+            [this, dataSpan, generateMips, invertY, srgb, texture, cancellationSource{m_cancellationSource}]() {
+                bimg::ImageContainer* image{ParseImage(m_allocator, dataSpan)};
+                image = PrepareImage(m_allocator, image, invertY, srgb, generateMips);
+                LoadTextureFromImage(texture, image, srgb);
             })
-            .then(m_runtimeScheduler, m_cancelSource, [texture, dataRef = Napi::Persistent(data)](bimg::ImageContainer* image) {
-                CreateTextureFromImage(texture, image);
-            })
-            .then(arcana::inline_scheduler, m_cancelSource, [onSuccessRef = Napi::Persistent(onSuccess), onErrorRef = Napi::Persistent(onError)](arcana::expected<void, std::exception_ptr> result) {
+            .then(m_runtimeScheduler, *m_cancellationSource, [dataRef{Napi::Persistent(data)}, onSuccessRef{Napi::Persistent(onSuccess)}, onErrorRef{Napi::Persistent(onError)}, cancellationSource{m_cancellationSource}](arcana::expected<void, std::exception_ptr> result) {
                 if (result.has_error())
                 {
                     onErrorRef.Call({});
@@ -1331,53 +1070,157 @@ namespace Babylon
             });
     }
 
+    void NativeEngine::CopyTexture(const Napi::CallbackInfo& info)
+    {
+        const auto textureDestination = info[0].As<Napi::Pointer<TextureData>>().Get();
+        const auto textureSource = info[1].As<Napi::Pointer<TextureData>>().Get();
+        const auto handleSource{textureSource->Handle};
+        // Make sure destination texture is valid for BLIT and is not created from static datas.
+        CreateBlitTexture(textureDestination);
+        const auto handleDestination{ textureDestination->Handle };
+
+        arcana::make_task(m_update.Scheduler(), *m_cancellationSource, [this, handleSource, handleDestination, cancellationSource{ m_cancellationSource }]() {
+        return arcana::make_task(m_runtimeScheduler, *m_cancellationSource, [this, handleSource, handleDestination, updateToken{m_update.GetUpdateToken()}, cancellationSource{m_cancellationSource}]()
+            {
+                // JS Thread
+                if (bgfx::getCaps()->supported & BGFX_CAPS_TEXTURE_BLIT)
+                {
+                    bgfx::Encoder* encoder = m_update.GetUpdateToken().GetEncoder();
+                    GetBoundFrameBuffer(*encoder).Blit(*encoder, handleDestination, 0, 0, handleSource);
+                }
+                else
+                {
+                    throw std::runtime_error{ "This platform does not support texture blit." };
+                }
+            }).then(arcana::inline_scheduler, *m_cancellationSource, [this, cancellationSource{ m_cancellationSource }](const arcana::expected<void, std::exception_ptr>& result) {
+                if (!cancellationSource->cancelled() && result.has_error())
+                {
+                    Napi::Error::New(Env(), result.error()).ThrowAsJavaScriptException();
+                }
+            });
+        });
+    }
+
+    void NativeEngine::LoadRawTexture(const Napi::CallbackInfo& info)
+    {
+        const auto texture{info[0].As<Napi::Pointer<TextureData>>().Get()};
+        const auto data{info[1].As<Napi::TypedArray>()};
+        const auto width{static_cast<uint16_t>(info[2].As<Napi::Number>().Uint32Value())};
+        const auto height{static_cast<uint16_t>(info[3].As<Napi::Number>().Uint32Value())};
+        const auto format{static_cast<bimg::TextureFormat::Enum>(info[4].As<Napi::Number>().Uint32Value())};
+        const auto generateMips{info[5].As<Napi::Boolean>().Value()};
+        const auto invertY{info[6].As<Napi::Boolean>().Value()};
+
+        const auto bytes{static_cast<uint8_t*>(data.ArrayBuffer().Data()) + data.ByteOffset()};
+        if (data.ByteLength() != bimg::imageGetSize(nullptr, width, height, 1, false, false, 1, format))
+        {
+            throw Napi::Error::New(Env(), "The data size does not match width, height, and format");
+        }
+
+        bimg::ImageContainer* image{bimg::imageAlloc(&m_allocator, format, width, height, 1, 1, false, false, bytes)};
+        image = PrepareImage(m_allocator, image, invertY, false, generateMips);
+        LoadTextureFromImage(texture, image, false);
+    }
+
+    void NativeEngine::LoadRawTexture2DArray(const Napi::CallbackInfo& info)
+    {
+        const auto texture{info[0].As<Napi::Pointer<TextureData>>().Get()};
+        const auto data = info[1].As<Napi::TypedArray>();
+        const auto width{static_cast<uint16_t>(info[2].As<Napi::Number>().Uint32Value())};
+        const auto height{static_cast<uint16_t>(info[3].As<Napi::Number>().Uint32Value())};
+        const auto depth{static_cast<uint16_t>(info[4].As<Napi::Number>().Int32Value())};
+        const auto format{static_cast<bimg::TextureFormat::Enum>(info[5].As<Napi::Number>().Uint32Value())};
+        const auto generateMips = info[6].As<Napi::Boolean>().Value();
+        const auto invertY = info[7].As<Napi::Boolean>().Value();
+
+        if (generateMips)
+        {
+            throw Napi::Error::New(Env(), "Texture 2D array currently do not support mipmaps.");
+        }
+
+        if (invertY)
+        {
+            throw Napi::Error::New(Env(), "Texture 2D array currently do not support invert Y.");
+        }
+
+        texture->Width = width;
+        texture->Height = height;
+        uint64_t flags{BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE | BGFX_CAPS_TEXTURE_2D_ARRAY};
+        texture->Handle = bgfx::createTexture2D(width, height, generateMips, depth, Cast(format), flags);
+        texture->OwnsHandle = true;
+
+        if (!data.IsNull())
+        {
+            if (data.ByteLength() != bimg::imageGetSize(nullptr, width, height, 1, false, false, depth, format))
+            {
+                throw Napi::Error::New(Env(), "The data size does not match width, height, depth and format");
+            }
+
+            uint8_t* dataPtr = static_cast<uint8_t*>(data.ArrayBuffer().Data()) + data.ByteOffset();
+            size_t dataSize = data.ByteLength();
+            
+            size_t textureSize = dataSize / static_cast<size_t>(depth);
+
+            for (uint16_t i = 0; i < depth; i++)
+            {
+                uint8_t* begin = dataPtr + (textureSize * static_cast<size_t>(i));
+                const bgfx::Memory* dataCopy = bgfx::copy(begin, static_cast<uint32_t>(textureSize)); // This is required since BGFX must manage the data the memory.
+                bgfx::updateTexture2D(texture->Handle, i, 0, 0, 0, width, height, dataCopy);
+            }
+        }
+    }
+
     void NativeEngine::LoadCubeTexture(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        const auto data = info[1].As<Napi::Array>();
-        const auto generateMips = info[2].As<Napi::Boolean>().Value();
-        const auto onSuccess = info[3].As<Napi::Function>();
-        const auto onError = info[4].As<Napi::Function>();
+        const auto texture = info[0].As<Napi::Pointer<TextureData>>().Get();
+        const auto data{info[1].As<Napi::Array>()};
+        const auto generateMips{info[2].As<Napi::Boolean>().Value()};
+        const auto invertY{info[3].As<Napi::Boolean>().Value()};
+        const auto srgb{info[4].As<Napi::Boolean>().Value()};
+        const auto onSuccess{info[5].As<Napi::Function>()};
+        const auto onError{info[6].As<Napi::Function>()};
 
+        std::array<Napi::Reference<Napi::TypedArray>, 6> dataRefs;
         std::array<arcana::task<bimg::ImageContainer*, std::exception_ptr>, 6> tasks;
         for (uint32_t face = 0; face < data.Length(); face++)
         {
-            const auto typedArray = data[face].As<Napi::TypedArray>();
-            const auto dataSpan = gsl::make_span(static_cast<uint8_t*>(typedArray.ArrayBuffer().Data()) + typedArray.ByteOffset(), typedArray.ByteLength());
-            tasks[face] = arcana::make_task(arcana::threadpool_scheduler, m_cancelSource, [this, dataSpan, generateMips]() {
-                bimg::ImageContainer* image = bimg::imageParse(&m_allocator, dataSpan.data(), static_cast<uint32_t>(dataSpan.size()));
-                if (generateMips)
-                {
-                    GenerateMips(&m_allocator, &image);
-                }
+            const auto typedArray{data[face].As<Napi::TypedArray>()};
+            const auto dataSpan{gsl::make_span(static_cast<uint8_t*>(typedArray.ArrayBuffer().Data()) + typedArray.ByteOffset(), typedArray.ByteLength())};
+            dataRefs[face] = Napi::Persistent(typedArray);
+            tasks[face] = arcana::make_task(arcana::threadpool_scheduler, *m_cancellationSource, [this, dataSpan, invertY, generateMips, srgb]() {
+                bimg::ImageContainer* image{ParseImage(m_allocator, dataSpan)};
+                image = PrepareImage(m_allocator, image, invertY, srgb, generateMips);
                 return image;
             });
         }
 
         arcana::when_all(gsl::make_span(tasks))
-            .then(m_runtimeScheduler, m_cancelSource,
-                [texture, dataRef = Napi::Persistent(data), generateMips](const std::vector<bimg::ImageContainer*>& images) {
-                    CreateCubeTextureFromImages(texture, images, generateMips);
-                })
-            .then(arcana::inline_scheduler, m_cancelSource, [this, onSuccessRef = Napi::Persistent(onSuccess)]() {
-                onSuccessRef.Call({Napi::Value::From(Env(), true)});
+            .then(arcana::inline_scheduler, *m_cancellationSource, [texture, srgb, cancellationSource{m_cancellationSource}](std::vector<bimg::ImageContainer*> images) {
+                LoadCubeTextureFromImages(texture, images, srgb);
             })
-            .then(arcana::inline_scheduler, m_cancelSource, [this, onErrorRef = Napi::Persistent(onError)](arcana::expected<void, std::exception_ptr> result) {
+            .then(m_runtimeScheduler, *m_cancellationSource, [dataRefs{std::move(dataRefs)}, onSuccessRef{Napi::Persistent(onSuccess)}, onErrorRef{Napi::Persistent(onError)}, cancellationSource{m_cancellationSource}](arcana::expected<void, std::exception_ptr> result) {
                 if (result.has_error())
                 {
-                    onErrorRef.Call({Napi::Value::From(Env(), true)});
+                    onErrorRef.Call({});
+                }
+                else
+                {
+                    onSuccessRef.Call({});
                 }
             });
     }
 
     void NativeEngine::LoadCubeTextureWithMips(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        const auto data = info[1].As<Napi::Array>();
-        const auto onSuccess = info[2].As<Napi::Function>();
-        const auto onError = info[3].As<Napi::Function>();
+        const auto texture = info[0].As<Napi::Pointer<TextureData>>().Get();
+        const auto data{info[1].As<Napi::Array>()};
+        const auto invertY{info[2].As<Napi::Boolean>().Value()};
+        const auto srgb{info[3].As<Napi::Boolean>().Value()};
+        const auto onSuccess{info[4].As<Napi::Function>()};
+        const auto onError{info[5].As<Napi::Function>()};
 
-        const auto numMips = data.Length();
+        const auto numMips{static_cast<size_t>(data.Length())};
+        std::vector<Napi::Reference<Napi::TypedArray>> dataRefs(6 * numMips);
         std::vector<arcana::task<bimg::ImageContainer*, std::exception_ptr>> tasks(6 * numMips);
         for (uint32_t mip = 0; mip < numMips; mip++)
         {
@@ -1386,139 +1229,121 @@ namespace Babylon
             {
                 const auto typedArray = faceData[face].As<Napi::TypedArray>();
                 const auto dataSpan = gsl::make_span(static_cast<uint8_t*>(typedArray.ArrayBuffer().Data()) + typedArray.ByteOffset(), typedArray.ByteLength());
-                tasks[(face * numMips) + mip] = arcana::make_task(arcana::threadpool_scheduler, m_cancelSource, [this, dataSpan]() {
-                    bimg::ImageContainer* image = bimg::imageParse(&m_allocator, dataSpan.data(), static_cast<uint32_t>(dataSpan.size()));
-                    FlipY(image);
+                dataRefs[(face * numMips) + mip] = Napi::Persistent(typedArray);
+                tasks[(face * numMips) + mip] = arcana::make_task(arcana::threadpool_scheduler, *m_cancellationSource, [this, dataSpan, invertY, srgb]() {
+                    bimg::ImageContainer* image{ParseImage(m_allocator, dataSpan)};
+                    image = PrepareImage(m_allocator, image, invertY, srgb, false);
                     return image;
                 });
             }
         }
 
         arcana::when_all(gsl::make_span(tasks))
-            .then(m_runtimeScheduler, m_cancelSource, [texture, dataRef = Napi::Persistent(data)](std::vector<bimg::ImageContainer*> images) {
-                CreateCubeTextureFromImages(texture, images, true);
+            .then(arcana::inline_scheduler, *m_cancellationSource, [texture, srgb, cancellationSource{m_cancellationSource}](std::vector<bimg::ImageContainer*> images) {
+                LoadCubeTextureFromImages(texture, images, srgb);
             })
-            .then(m_runtimeScheduler, m_cancelSource, [this, onSuccessRef = Napi::Persistent(onSuccess)]() {
-                onSuccessRef.Call({Napi::Value::From(Env(), true)});
-            })
-            .then(arcana::inline_scheduler, m_cancelSource, [this, onErrorRef = Napi::Persistent(onError)](arcana::expected<void, std::exception_ptr> result) {
+            .then(m_runtimeScheduler, *m_cancellationSource, [dataRefs{std::move(dataRefs)}, onSuccessRef{Napi::Persistent(onSuccess)}, onErrorRef{Napi::Persistent(onError)}, cancellationSource{m_cancellationSource}](arcana::expected<void, std::exception_ptr> result) {
                 if (result.has_error())
                 {
-                    onErrorRef.Call({Napi::Value::From(Env(), true)});
+                    onErrorRef.Call({});
+                }
+                else
+                {
+                    onSuccessRef.Call({});
                 }
             });
     }
 
     Napi::Value NativeEngine::GetTextureWidth(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
+        const TextureData* texture = info[0].As<Napi::Pointer<TextureData>>().Get();
         return Napi::Value::From(info.Env(), texture->Width);
     }
 
     Napi::Value NativeEngine::GetTextureHeight(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
+        const TextureData* texture = info[0].As<Napi::Pointer<TextureData>>().Get();
         return Napi::Value::From(info.Env(), texture->Height);
     }
 
-    void NativeEngine::SetTextureSampling(const Napi::CallbackInfo& info)
+    void NativeEngine::SetTextureSampling(NativeDataStream::Reader& data)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        auto filter = static_cast<uint32_t>(info[1].As<Napi::Number>().Uint32Value());
+        auto& texture = *data.ReadPointer<TextureData>();
+        const auto value = data.ReadUint32();
 
-        constexpr std::array<uint32_t, 12> bgfxFiltering = {
-            BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIN_POINT,                          // nearest is mag = nearest and min = nearest and mip = linear
-            BGFX_SAMPLER_MIP_POINT,                                                   // Bilinear is mag = linear and min = linear and mip = nearest
-            0,                                                                        // Trilinear is mag = linear and min = linear and mip = linear
-            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT, // mag = nearest and min = nearest and mip = nearest
-            BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT,                          // mag = nearest and min = linear and mip = nearest
-            BGFX_SAMPLER_MAG_POINT,                                                   // mag = nearest and min = linear and mip = linear
-            BGFX_SAMPLER_MAG_POINT,                                                   // mag = nearest and min = linear and mip = none
-            BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIN_POINT,                          // mag = nearest and min = nearest and mip = none
-            BGFX_SAMPLER_MIP_POINT | BGFX_SAMPLER_MIP_POINT,                          // mag = linear and min = nearest and mip = nearest
-            BGFX_SAMPLER_MIN_POINT,                                                   // mag = linear and min = nearest and mip = linear
-            0,                                                                        // mag = linear and min = linear and mip = none
-            BGFX_SAMPLER_MIN_POINT};                                                  // mag = linear and min = nearest and mip = none
+        texture.Flags &= ~(BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT);
+        texture.Flags |= value;
 
-        texture->Flags &= ~(BGFX_SAMPLER_MIN_MASK | BGFX_SAMPLER_MAG_MASK | BGFX_SAMPLER_MIP_MASK);
-
-        if (texture->AnisotropicLevel > 1)
+        // Disable anisotropy if either min/mag are point.
+        if ((texture.Flags & BGFX_SAMPLER_MIN_POINT) != 0 || (texture.Flags & BGFX_SAMPLER_MAG_POINT) != 0)
         {
-            texture->Flags |= BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
-        }
-        else
-        {
-            texture->Flags |= bgfxFiltering[filter];
+            texture.Flags &= ~(BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC);
         }
     }
 
-    void NativeEngine::SetTextureWrapMode(const Napi::CallbackInfo& info)
+    void NativeEngine::SetTextureWrapMode(NativeDataStream::Reader& data)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        auto addressModeU = static_cast<uint32_t>(info[1].As<Napi::Number>().Uint32Value());
-        auto addressModeV = static_cast<uint32_t>(info[2].As<Napi::Number>().Uint32Value());
-        auto addressModeW = static_cast<uint32_t>(info[3].As<Napi::Number>().Uint32Value());
+        auto& texture = *data.ReadPointer<TextureData>();
+        auto addressModeU = data.ReadUint32();
+        auto addressModeV = data.ReadUint32();
+        auto addressModeW = data.ReadUint32();
 
-        constexpr std::array<uint32_t, 3> bgfxSamplers = {0, BGFX_SAMPLER_U_CLAMP, BGFX_SAMPLER_U_MIRROR};
+        uint32_t addressMode = addressModeU +
+            (addressModeV << BGFX_SAMPLER_V_SHIFT) +
+            (addressModeW << BGFX_SAMPLER_W_SHIFT);
 
-        uint32_t addressMode = bgfxSamplers[addressModeU] +
-            (bgfxSamplers[addressModeV] << BGFX_SAMPLER_V_SHIFT) +
-            (bgfxSamplers[addressModeW] << BGFX_SAMPLER_W_SHIFT);
-
-        texture->Flags &= ~(BGFX_SAMPLER_U_MASK | BGFX_SAMPLER_V_MASK | BGFX_SAMPLER_W_MASK);
-        texture->Flags |= addressMode;
+        texture.Flags &= ~(BGFX_SAMPLER_U_MASK | BGFX_SAMPLER_V_MASK | BGFX_SAMPLER_W_MASK);
+        texture.Flags |= addressMode;
     }
 
-    void NativeEngine::SetTextureAnisotropicLevel(const Napi::CallbackInfo& info)
+    void NativeEngine::SetTextureAnisotropicLevel(NativeDataStream::Reader& data)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        const auto value = info[1].As<Napi::Number>().Uint32Value();
+        auto& texture = *data.ReadPointer<TextureData>();
+        const auto value = data.ReadUint32();
 
-        texture->AnisotropicLevel = static_cast<uint8_t>(value);
+        texture.Flags &= ~(BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC);
 
-        // if Anisotropic is set to 0 after being >1, then set texture flags back to linear
-        texture->Flags &= ~(BGFX_SAMPLER_MIN_MASK | BGFX_SAMPLER_MAG_MASK | BGFX_SAMPLER_MIP_MASK);
-        if (value)
+        // Enable anisotropy only if neither min/mag are point.
+        // Note that bgfx currently only supports no anisotropy or max anisotropy.
+        if ((texture.Flags & BGFX_SAMPLER_MIN_POINT) == 0 && (texture.Flags & BGFX_SAMPLER_MAG_POINT) == 0 && value > 1)
         {
-            texture->Flags |= BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+            texture.Flags |= BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+
+            // There is a bug in bgfx that causes the samplers to do the wrong thing in DirectX.
+            // Remove this once https://github.com/bkaradzic/bgfx/pull/2609 is merged.
+            texture.Flags &= ~BGFX_SAMPLER_MIP_MASK;
         }
     }
 
-    void NativeEngine::SetTexture(const Napi::CallbackInfo& info)
+    void NativeEngine::SetTexture(NativeDataStream::Reader& data)
     {
-        const auto uniformData = info[0].As<Napi::External<UniformInfo>>().Data();
-        const auto texture = info[1].As<Napi::External<TextureData>>().Data();
+        bgfx::Encoder* encoder = GetUpdateToken().GetEncoder();
 
-        bgfx::setTexture(uniformData->Stage, uniformData->Handle, texture->Handle, texture->Flags);
+        const UniformInfo* uniformInfo = data.ReadPointer<UniformInfo>();
+        const TextureData* texture = data.ReadPointer<TextureData>();
+
+        encoder->setTexture(uniformInfo->Stage, uniformInfo->Handle, texture->Handle, texture->Flags);
     }
 
     void NativeEngine::DeleteTexture(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
-        delete texture;
+        TextureData* texture = info[0].As<Napi::Pointer<TextureData>>().Get();
+        m_graphicsImpl.RemoveTexture(texture->Handle);
+        texture->Dispose();
     }
 
     Napi::Value NativeEngine::CreateFrameBuffer(const Napi::CallbackInfo& info)
     {
-        const auto texture = info[0].As<Napi::External<TextureData>>().Data();
+        TextureData* texture = info[0].As<Napi::Pointer<TextureData>>().Get();
         uint16_t width = static_cast<uint16_t>(info[1].As<Napi::Number>().Uint32Value());
         uint16_t height = static_cast<uint16_t>(info[2].As<Napi::Number>().Uint32Value());
-        uint32_t formatIndex = info[3].As<Napi::Number>().Uint32Value();
-        //int samplingMode = info[4].As<Napi::Number>().Uint32Value();
-        bool generateStencilBuffer = info[5].As<Napi::Boolean>();
-        bool generateDepth = info[6].As<Napi::Boolean>();
-        bool generateMips = info[7].As<Napi::Boolean>();
+        bgfx::TextureFormat::Enum format = static_cast<bgfx::TextureFormat::Enum>(info[3].As<Napi::Number>().Uint32Value());
+        bool generateStencilBuffer = info[4].As<Napi::Boolean>();
+        bool generateDepth = info[5].As<Napi::Boolean>();
+        bool generateMips = info[6].As<Napi::Boolean>();
 
         bgfx::FrameBufferHandle frameBufferHandle{};
-        if (generateStencilBuffer && !generateDepth)
-        {
-            throw std::exception{/* Does this case even make any sense? */};
-        }
-        else if (!generateStencilBuffer && !generateDepth)
-        {
-            frameBufferHandle = bgfx::createFrameBuffer(width, height, TEXTURE_FORMAT[formatIndex], BGFX_TEXTURE_RT);
-        }
-        else
+        if (generateDepth)
         {
             auto depthStencilFormat = bgfx::TextureFormat::D32;
             if (generateStencilBuffer)
@@ -1526,12 +1351,16 @@ namespace Babylon
                 depthStencilFormat = bgfx::TextureFormat::D24S8;
             }
 
-            assert(bgfx::isTextureValid(0, false, 1, TEXTURE_FORMAT[formatIndex], BGFX_TEXTURE_RT));
+            assert(bgfx::isTextureValid(0, false, 1, format, BGFX_TEXTURE_RT));
             assert(bgfx::isTextureValid(0, false, 1, depthStencilFormat, BGFX_TEXTURE_RT));
 
+            // bgfx doesn't add flag D3D11_RESOURCE_MISC_GENERATE_MIPS for depth textures (missing that flag will crash D3D with resolving)
+            // And not sure it makes sense to generate mipmaps from a depth buffer with exponential values.
+            // only allows mipmaps resolve step when mipmapping is asked and for the color texture, not the depth.
+            // https://github.com/bkaradzic/bgfx/blob/2c21f68998595fa388e25cb6527e82254d0e9bff/src/renderer_d3d11.cpp#L4525
             std::array<bgfx::TextureHandle, 2> textures{
-                bgfx::createTexture2D(width, height, generateMips, 1, TEXTURE_FORMAT[formatIndex], BGFX_TEXTURE_RT),
-                bgfx::createTexture2D(width, height, generateMips, 1, depthStencilFormat, BGFX_TEXTURE_RT)};
+                bgfx::createTexture2D(width, height, generateMips, 1, format, BGFX_TEXTURE_RT),
+                bgfx::createTexture2D(width, height, false, 1, depthStencilFormat, BGFX_TEXTURE_RT)};
             std::array<bgfx::Attachment, textures.size()> attachments{};
             for (size_t idx = 0; idx < attachments.size(); ++idx)
             {
@@ -1539,82 +1368,124 @@ namespace Babylon
             }
             frameBufferHandle = bgfx::createFrameBuffer(static_cast<uint8_t>(attachments.size()), attachments.data(), true);
         }
-
-        texture->Handle = bgfx::getTexture(frameBufferHandle);
-
-        return Napi::External<FrameBufferData>::New(info.Env(), m_frameBufferManager.CreateNew(frameBufferHandle, width, height));
-    }
-
-    void NativeEngine::DeleteFrameBuffer(const Napi::CallbackInfo& info)
-    {
-        const auto frameBufferData = info[0].As<Napi::External<FrameBufferData>>().Data();
-        delete frameBufferData;
-    }
-
-    void NativeEngine::BindFrameBuffer(const Napi::CallbackInfo& info)
-    {
-        const auto frameBufferData = info[0].As<Napi::External<FrameBufferData>>().Data();
-        m_frameBufferManager.Bind(frameBufferData);
-    }
-
-    void NativeEngine::UnbindFrameBuffer(const Napi::CallbackInfo& info)
-    {
-        const auto frameBufferData = info[0].As<Napi::External<FrameBufferData>>().Data();
-        m_frameBufferManager.Unbind(frameBufferData);
-    }
-
-    void NativeEngine::DrawIndexed(const Napi::CallbackInfo& /*info*/)
-    {
-        //const auto fillMode = info[0].As<Napi::Number>().Int32Value();
-        //const auto elementStart = info[1].As<Napi::Number>().Int32Value();
-        //const auto elementCount = info[2].As<Napi::Number>().Int32Value();
-
-        // TODO: handle viewport
-
-        for (const auto& it : m_currentProgram->Uniforms)
+        else
         {
-            const ProgramData::UniformValue& value = it.second;
-            bgfx::setUniform({it.first}, value.Data.data(), value.ElementLength);
+            assert(!generateStencilBuffer);
+            frameBufferHandle = bgfx::createFrameBuffer(width, height, format, BGFX_TEXTURE_RT);
         }
 
-        bgfx::setState(m_engineState);
-#if (ANDROID)
-        // TODO : find why we need to discard state on Android
-        bgfx::submit(m_frameBufferManager.GetBound().ViewId, m_currentProgram->Program, 0, false);
-#else
-        bgfx::submit(m_frameBufferManager.GetBound().ViewId, m_currentProgram->Program, 0, BGFX_DISCARD_INSTANCE_DATA | BGFX_DISCARD_STATE | BGFX_DISCARD_TRANSFORM);
-#endif
+        texture->Handle = bgfx::getTexture(frameBufferHandle);
+        texture->OwnsHandle = false;
+
+        m_graphicsImpl.AddTexture(texture->Handle, width, height, generateMips, 1, format);
+
+        FrameBuffer* frameBuffer = new FrameBuffer(m_graphicsImpl, frameBufferHandle, width, height, false, generateDepth, generateStencilBuffer);
+        return Napi::Pointer<FrameBuffer>::Create(info.Env(), frameBuffer, Napi::NapiPointerDeleter(frameBuffer));
     }
 
-    void NativeEngine::Draw(const Napi::CallbackInfo& /*info*/)
+    // TODO: This doesn't get called when an Engine instance is disposed.
+    void NativeEngine::DeleteFrameBuffer(NativeDataStream::Reader& data)
     {
-        //const auto fillMode = info[0].As<Napi::Number>().Int32Value();
-        //const auto elementStart = info[1].As<Napi::Number>().Int32Value();
-        //const auto elementCount = info[2].As<Napi::Number>().Int32Value();
-
-        // STUB: Stub.
-        // bgfx::submit(), right?  Which means we have to preserve here the state of
-        // which program is being worked on.
+        data.ReadPointer<FrameBuffer>()->Dispose();
     }
 
-    void NativeEngine::Clear(const Napi::CallbackInfo& info)
+    void NativeEngine::BindFrameBuffer(NativeDataStream::Reader& data)
     {
-        m_frameBufferManager.GetBound().ViewClearState.UpdateFlags(info);
+        auto encoder = GetUpdateToken().GetEncoder();
+
+        FrameBuffer* frameBuffer = data.ReadPointer<FrameBuffer>();
+        m_boundFrameBuffer->Unbind(*encoder);
+        m_boundFrameBuffer = frameBuffer;
+        m_boundFrameBuffer->Bind(*encoder);
+        m_boundFrameBufferNeedsRebinding.Set(*encoder, false);
     }
 
-    void NativeEngine::ClearColor(const Napi::CallbackInfo& info)
+    void NativeEngine::UnbindFrameBuffer(NativeDataStream::Reader& data)
     {
-        m_frameBufferManager.GetBound().ViewClearState.UpdateColor(info);
+        bgfx::Encoder* encoder = GetUpdateToken().GetEncoder();
+
+        const FrameBuffer* frameBuffer = data.ReadPointer<FrameBuffer>();
+
+        assert(m_boundFrameBuffer == frameBuffer);
+        UNUSED(frameBuffer);
+
+        m_boundFrameBuffer->Unbind(*encoder);
+        m_boundFrameBuffer = nullptr;
+        m_boundFrameBufferNeedsRebinding.Set(*encoder, false);
     }
 
-    void NativeEngine::ClearStencil(const Napi::CallbackInfo& info)
+    void NativeEngine::DrawIndexed(NativeDataStream::Reader& data)
     {
-        m_frameBufferManager.GetBound().ViewClearState.UpdateStencil(info);
+        bgfx::Encoder* encoder{GetUpdateToken().GetEncoder()};
+
+        const uint32_t fillMode = data.ReadUint32();
+        const uint32_t indexStart = data.ReadUint32();
+        const uint32_t indexCount = data.ReadUint32();
+
+        if (m_boundVertexArray != nullptr)
+        {
+            m_boundVertexArray->SetIndexBuffer(encoder, indexStart, indexCount);
+            m_boundVertexArray->SetVertexBuffers(encoder, 0, std::numeric_limits<uint32_t>::max());
+        }
+
+        DrawInternal(encoder, fillMode);
     }
 
-    void NativeEngine::ClearDepth(const Napi::CallbackInfo& info)
+    void NativeEngine::Draw(NativeDataStream::Reader& data)
     {
-        m_frameBufferManager.GetBound().ViewClearState.UpdateDepth(info);
+        bgfx::Encoder* encoder{GetUpdateToken().GetEncoder()};
+
+        const uint32_t fillMode = data.ReadUint32();
+        const uint32_t verticesStart = data.ReadUint32();
+        const uint32_t verticesCount = data.ReadUint32();
+
+        if (m_boundVertexArray != nullptr)
+        {
+            m_boundVertexArray->SetVertexBuffers(encoder, verticesStart, verticesCount);
+        }
+
+        DrawInternal(encoder, fillMode);
+    }
+
+    void NativeEngine::Clear(NativeDataStream::Reader& data)
+    {
+        bgfx::Encoder* encoder{GetUpdateToken().GetEncoder()};
+
+        uint16_t flags{0};
+        uint32_t rgba{0x000000ff};
+
+        const bool shouldClearColor{static_cast<bool>(data.ReadUint32())};
+        const float r{data.ReadFloat32()};
+        const float g{data.ReadFloat32()};
+        const float b{data.ReadFloat32()};
+        const float a{data.ReadFloat32()};
+        const bool shouldClearDepth{static_cast<bool>(data.ReadUint32())};
+        const float depth{data.ReadFloat32()};
+        const bool shouldClearStencil{static_cast<bool>(data.ReadUint32())};
+        const uint8_t stencil{static_cast<uint8_t>(data.ReadUint32())};
+
+        if (shouldClearColor)
+        {
+            rgba =
+                (static_cast<uint8_t>(r * std::numeric_limits<uint8_t>::max()) << 24) +
+                (static_cast<uint8_t>(g * std::numeric_limits<uint8_t>::max()) << 16) +
+                (static_cast<uint8_t>(b * std::numeric_limits<uint8_t>::max()) << 8) +
+                static_cast<uint8_t>(a * std::numeric_limits<uint8_t>::max());
+
+            flags |= BGFX_CLEAR_COLOR;
+        }
+
+        if (shouldClearDepth && (!m_boundFrameBuffer || m_boundFrameBuffer->HasDepth()))
+        {
+            flags |= BGFX_CLEAR_DEPTH;
+        }
+
+        if (shouldClearStencil && (!m_boundFrameBuffer || m_boundFrameBuffer->HasStencil()))
+        {
+            flags |= BGFX_CLEAR_STENCIL;
+        }
+
+        GetBoundFrameBuffer(*encoder).Clear(*encoder, flags, rgba, depth, stencil);
     }
 
     Napi::Value NativeEngine::GetRenderWidth(const Napi::CallbackInfo& info)
@@ -1629,50 +1500,287 @@ namespace Babylon
 
     void NativeEngine::SetViewPort(const Napi::CallbackInfo& info)
     {
+        bgfx::Encoder* encoder{GetUpdateToken().GetEncoder()};
+
         const auto x = info[0].As<Napi::Number>().FloatValue();
         const auto y = info[1].As<Napi::Number>().FloatValue();
         const auto width = info[2].As<Napi::Number>().FloatValue();
         const auto height = info[3].As<Napi::Number>().FloatValue();
-
-        const auto backbufferWidth = bgfx::getStats()->width;
-        const auto backbufferHeight = bgfx::getStats()->height;
         const float yOrigin = bgfx::getCaps()->originBottomLeft ? y : (1.f - y - height);
 
-        m_frameBufferManager.GetBound().UseViewId(m_frameBufferManager.GetNewViewId());
-        const bgfx::ViewId viewId = m_frameBufferManager.GetBound().ViewId;
-        bgfx::setViewFrameBuffer(viewId, m_frameBufferManager.GetBound().FrameBuffer);
-        bgfx::setViewRect(viewId,
-            static_cast<uint16_t>(x * backbufferWidth),
-            static_cast<uint16_t>(yOrigin * backbufferHeight),
-            static_cast<uint16_t>(width * backbufferWidth),
-            static_cast<uint16_t>(height * backbufferHeight));
+        GetBoundFrameBuffer(*encoder).SetViewPort(*encoder, x, yOrigin, width, height);
     }
 
-    void NativeEngine::GetFramebufferData(const Napi::CallbackInfo& info)
+    Napi::Value NativeEngine::GetHardwareScalingLevel(const Napi::CallbackInfo& info)
     {
-        bgfx::FrameBufferHandle fbh = BGFX_INVALID_HANDLE;
-        const auto callback = info[0].As<Napi::Function>();
-
-        s_bgfxCallback.addScreenShotCallback(callback);
-        bgfx::requestScreenShot(fbh, "GetImageData");
+        return Napi::Value::From(info.Env(), m_graphicsImpl.GetHardwareScalingLevel());
     }
 
-    Napi::Value NativeEngine::GetRenderAPI(const Napi::CallbackInfo& info)
+    void NativeEngine::SetHardwareScalingLevel(const Napi::CallbackInfo& info)
     {
-        return Napi::Value::From(info.Env(), static_cast<int>(bgfx::getRendererType()));
+        const auto level = info[0].As<Napi::Number>().FloatValue();
+        m_graphicsImpl.SetHardwareScalingLevel(level);
     }
 
-    void NativeEngine::EndFrame()
+    Napi::Value NativeEngine::CreateImageBitmap(const Napi::CallbackInfo& info)
     {
-        GetFrameBufferManager().Reset();
+        const Napi::Env env{info.Env()};
 
-        bgfx::frame();
+        if (!info[0].IsArrayBuffer())
+        {
+            throw Napi::Error::New(env, "CreateImageBitmap parameter is not an array buffer.");
+        }
+
+        const auto data{info[0].As<Napi::ArrayBuffer>()};
+
+        if (!data.ByteLength())
+        {
+            throw Napi::Error::New(env, "CreateImageBitmap array buffer is empty.");
+        }
+
+        bimg::ImageContainer* image{ParseImage(m_allocator, gsl::make_span(static_cast<uint8_t*>(data.Data()), data.ByteLength()))};
+
+        Napi::Object imageBitmap{Napi::Object::New(env)};
+        Napi::Uint8Array buffer{Napi::Uint8Array::New(env, image->m_size)};
+        std::memcpy(buffer.Data(), image->m_data, image->m_size);
+
+        imageBitmap.Set("data", buffer);
+        imageBitmap.Set("width", Napi::Value::From(env, image->m_width));
+        imageBitmap.Set("height", Napi::Value::From(env, image->m_height));
+        imageBitmap.Set("depth", Napi::Value::From(env, image->m_depth));
+        imageBitmap.Set("numLayers", Napi::Value::From(env, image->m_numLayers));
+        imageBitmap.Set("format", Napi::Value::From(env, static_cast<uint32_t>(image->m_format)));
+
+        bimg::imageFree(image);
+        return std::move(imageBitmap);
     }
 
-    void NativeEngine::Dispatch(std::function<void()> function)
+    Napi::Value NativeEngine::ResizeImageBitmap(const Napi::CallbackInfo& info)
     {
-        m_runtime.Dispatch([function = std::move(function)](Napi::Env) {
-            function();
+        const auto imageBitmap = info[0].As<Napi::Object>();
+        const auto bufferWidth = info[1].As<Napi::Number>().Uint32Value();
+        const auto bufferHeight = info[2].As<Napi::Number>().Uint32Value();
+
+        const auto data = imageBitmap.Get("data").As<Napi::Uint8Array>();
+        const auto width = imageBitmap.Get("width").As<Napi::Number>().Uint32Value();
+        const auto height = imageBitmap.Get("height").As<Napi::Number>().Uint32Value();
+        const auto format = static_cast<bimg::TextureFormat::Enum>(imageBitmap.Get("format").As<Napi::Number>().Uint32Value());
+
+        const Napi::Env env{info.Env()};
+
+        bimg::ImageContainer* image = bimg::imageAlloc(&m_allocator, format, static_cast<uint16_t>(width), static_cast<uint16_t>(height), 1, 1, false, false, data.Data());
+        if (image == nullptr)
+        {
+            throw Napi::Error::New(env, "Unable to allocate image for ResizeImageBitmap.");
+        }
+
+        if (format != bimg::TextureFormat::RGBA8)
+        {
+            if (format == bimg::TextureFormat::R8)
+            {
+                image->m_format = bimg::TextureFormat::A8;
+            }
+            bimg::ImageContainer* rgba = bimg::imageConvert(&m_allocator, bimg::TextureFormat::RGBA8, *image, false);
+            if (rgba == nullptr)
+            {
+                throw Napi::Error::New(env, "Unable to convert image to RGBA pixel format for ResizeImageBitmap.");
+            }
+            bimg::imageFree(image);
+            image = rgba;
+        }
+
+        auto outputData = Napi::Uint8Array::New(env, bufferWidth * bufferHeight * 4);
+        if (width != bufferWidth || height != bufferHeight)
+        {
+            stbir_resize_uint8(static_cast<unsigned char*>(image->m_data), width, height, 0,
+                outputData.Data(), bufferWidth, bufferHeight, 0, 4);
+        }
+        else
+        {
+            std::memcpy(outputData.Data(), image->m_data, image->m_size);
+        }
+        bimg::imageFree(image);
+        return Napi::Value::From(env, outputData);
+    }
+
+    void NativeEngine::GetFrameBufferData(const Napi::CallbackInfo& info)
+    {
+        const auto callback{info[0].As<Napi::Function>()};
+
+        auto callbackPtr{std::make_shared<Napi::FunctionReference>(Napi::Persistent(callback))};
+        m_graphicsImpl.RequestScreenShot([this, callbackPtr{std::move(callbackPtr)}](std::vector<uint8_t> array) {
+            m_runtime.Dispatch([callbackPtr{std::move(callbackPtr)}, array{std::move(array)}](Napi::Env env) {
+                auto arrayBuffer{Napi::ArrayBuffer::New(env, const_cast<uint8_t*>(array.data()), array.size())};
+                auto typedArray{Napi::Uint8Array::New(env, array.size(), arrayBuffer, 0)};
+                callbackPtr->Value().Call({typedArray});
+            });
+        });
+    }
+
+    void NativeEngine::SetStencil(NativeDataStream::Reader& data)
+    {
+        const uint32_t writeMask{data.ReadUint32()};
+        const uint32_t stencilOpFail{data.ReadUint32()};
+        const uint32_t depthOpFail{data.ReadUint32()};
+        const uint32_t depthOpPass{data.ReadUint32()};
+        const uint32_t func{data.ReadUint32()};
+        const uint32_t ref{data.ReadUint32()};
+
+        m_stencilState = BGFX_STENCIL_FUNC_RMASK(0xFF); //  always 0xFF
+        m_stencilState |= stencilOpFail;
+        m_stencilState |= depthOpFail;
+        // bgfx write mask is always 0xFF, to not change stencil value when writemask is 0
+        // its value is kept unchanged.
+        // https://github.com/bkaradzic/bgfx/blob/2c21f68998595fa388e25cb6527e82254d0e9bff/src/renderer_d3d11.cpp#L2874
+        if (writeMask == 0)
+        {
+            m_stencilState |= BGFX_STENCIL_OP_PASS_Z_KEEP;
+        }
+        else
+        {
+            m_stencilState |= depthOpPass;
+        }
+        m_stencilState |= func;
+        m_stencilState |= BGFX_STENCIL_FUNC_REF(ref);
+    }
+
+    void NativeEngine::SetCommandDataStream(const Napi::CallbackInfo& info)
+    {
+        // TODO: This should be moved to the constructor once multi-update is available.
+        Napi::Object jsCommandStream = info[0].ToObject();
+        m_commandStream = Napi::ObjectWrap<NativeDataStream>::Unwrap(jsCommandStream.Get("_nativeDataStream").As<Napi::Object>());
+    }
+
+    void NativeEngine::SubmitCommands(const Napi::CallbackInfo&)
+    {
+        NativeDataStream::Reader reader = m_commandStream->GetReader();
+        while (reader.CanRead())
+        {
+            std::invoke(reader.ReadPointer<CommandFunctionPointerT>(), this, reader);
+        }
+    }
+
+    void NativeEngine::DrawInternal(bgfx::Encoder* encoder, uint32_t fillMode)
+    {
+        uint64_t fillModeState{0}; // indexed triangle list
+        switch (fillMode)
+        {
+            case 0: // MATERIAL_TriangleFillMode
+            {
+                fillModeState = 0;
+                break;
+            }
+            case 1: // MATERIAL_WireFrameFillMode
+            case 4: // MATERIAL_LineListDrawMode
+            {
+                fillModeState = BGFX_STATE_PT_LINES;
+                break;
+            }
+            case 2: // MATERIAL_PointFillMode
+            case 3: // MATERIAL_PointListDrawMode
+            {
+                fillModeState = BGFX_STATE_PT_POINTS;
+                break;
+            }
+            case 5: // MATERIAL_LineLoopDrawMode
+            {
+                // TODO: unsupported mode
+                break;
+            }
+            case 6: // MATERIAL_LineStripDrawMode
+            {
+                fillModeState = BGFX_STATE_PT_LINESTRIP;
+                break;
+            }
+            case 7: // MATERIAL_TriangleStripDrawMode
+            {
+                fillModeState = BGFX_STATE_PT_TRISTRIP;
+                break;
+            }
+            case 8: // MATERIAL_TriangleFanDrawMode
+            {
+                // TODO: unsupported mode
+                break;
+            }
+        }
+
+        for (const auto& it : m_currentProgram->Uniforms)
+        {
+            const ProgramData::UniformValue& value = it.second;
+            encoder->setUniform({ it.first }, value.Data.data(), value.ElementLength);
+        }
+
+        auto& boundFrameBuffer = GetBoundFrameBuffer(*encoder);
+        if (boundFrameBuffer.HasDepth())
+        {
+            encoder->setState(m_engineState | fillModeState);
+        }
+        else
+        {
+            encoder->setState((m_engineState & ~BGFX_STATE_WRITE_Z) | fillModeState);
+        }
+
+        // stencil
+        boundFrameBuffer.SetStencil(*encoder, m_stencilState);
+
+        // Discard everything except bindings since we keep the state of everything else.
+        boundFrameBuffer.Submit(*encoder, m_currentProgram->Handle, BGFX_DISCARD_ALL & ~BGFX_DISCARD_BINDINGS);
+    }
+
+    GraphicsImpl::UpdateToken& NativeEngine::GetUpdateToken()
+    {
+        if (!m_updateToken)
+        {
+            m_updateToken.emplace(m_update.GetUpdateToken());
+            m_runtime.Dispatch([this](auto) {
+                m_updateToken.reset();
+            });
+        }
+
+        return m_updateToken.value();
+    }
+
+    FrameBuffer& NativeEngine::GetBoundFrameBuffer(bgfx::Encoder& encoder)
+    {
+        if (m_boundFrameBuffer == nullptr)
+        {
+            m_boundFrameBuffer = &m_defaultFrameBuffer;
+            m_defaultFrameBuffer.Bind(encoder);
+        } else if (m_boundFrameBufferNeedsRebinding.Get(encoder))
+        {
+            m_boundFrameBuffer->Unbind(encoder);
+            m_boundFrameBuffer->Bind(encoder);
+        }
+        
+        m_boundFrameBufferNeedsRebinding.Set(encoder, false);
+        return *m_boundFrameBuffer;
+    }
+
+    void NativeEngine::ScheduleRequestAnimationFrameCallbacks()
+    {
+        if (m_requestAnimationFrameCallbacksScheduled)
+        {
+            return;
+        }
+
+        m_requestAnimationFrameCallbacksScheduled = true;
+
+        arcana::make_task(m_update.Scheduler(), *m_cancellationSource, [this, cancellationSource{m_cancellationSource}]() {
+            return arcana::make_task(m_runtimeScheduler, *m_cancellationSource, [this, updateToken{m_update.GetUpdateToken()}, cancellationSource{m_cancellationSource}]() {
+                m_requestAnimationFrameCallbacksScheduled = false;
+
+                arcana::trace_region scheduleRegion{"NativeEngine::ScheduleRequestAnimationFrameCallbacks invoke JS callbacks"};
+                auto callbacks{std::move(m_requestAnimationFrameCallbacks)};
+                for (auto& callback : callbacks)
+                {
+                    callback.Value().Call({});
+                }
+            }).then(arcana::inline_scheduler, *m_cancellationSource, [this, cancellationSource{m_cancellationSource}](const arcana::expected<void, std::exception_ptr>& result) {
+                if (!cancellationSource->cancelled() && result.has_error())
+                {
+                    Napi::Error::New(Env(), result.error()).ThrowAsJavaScriptException();
+                }
+            });
         });
     }
 }

@@ -1,6 +1,30 @@
 #include "XMLHttpRequest.h"
 #include <Babylon/JsRuntime.h>
 #include <Babylon/Polyfills/XMLHttpRequest.h>
+#include <sstream>
+
+bool IsHexChar(const char& c)
+{
+    return ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f') || (c >= '0' && c <= '9'));
+}
+
+std::string EncodePercent(const std::string& input)
+{
+    std::ostringstream encoded;
+    for (auto i = input.begin(), e = input.end(); i != e; ++i)
+    {
+        encoded << *i;
+        if (*i == '%')
+        {
+            if (std::distance(i, e) >= 2 && !(IsHexChar(*(i + 1)) && IsHexChar(*(i + 2))))
+            {
+                // If a percent character is not followed by two hex characters, we should encode it
+                encoded << "25";
+            }
+        }
+    }
+    return encoded.str();
+}
 
 namespace Babylon::Polyfills::Internal
 {
@@ -18,7 +42,7 @@ namespace Babylon::Polyfills::Internal
                 if (value == ArrayBuffer)
                     return UrlLib::UrlResponseType::Buffer;
 
-                throw std::exception{};
+                throw std::runtime_error{"Unsupported response type: " + value};
             }
 
             const char* EnumToString(UrlLib::UrlResponseType value)
@@ -31,7 +55,7 @@ namespace Babylon::Polyfills::Internal
                         return ArrayBuffer;
                 }
 
-                throw std::exception{};
+                throw std::runtime_error{"Invalid response type"};
             }
         }
 
@@ -44,13 +68,14 @@ namespace Babylon::Polyfills::Internal
                 if (value == Get)
                     return UrlLib::UrlMethod::Get;
 
-                throw;
+                throw std::runtime_error{"Unsupported url method: " + value};
             }
         }
 
         namespace EventType
         {
             constexpr const char* ReadyStateChange = "readystatechange";
+            constexpr const char* LoadEnd = "loadend";
         }
     }
 
@@ -58,9 +83,11 @@ namespace Babylon::Polyfills::Internal
     {
         Napi::HandleScope scope{env};
 
+        static constexpr auto JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME = "XMLHttpRequest";
+
         Napi::Function func = DefineClass(
             env,
-            "XMLHttpRequest",
+            JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME,
             {
                 StaticValue("UNSENT", Napi::Value::From(env, 0)),
                 StaticValue("OPENED", Napi::Value::From(env, 1)),
@@ -80,7 +107,12 @@ namespace Babylon::Polyfills::Internal
                 InstanceMethod("send", &XMLHttpRequest::Send),
             });
 
-        env.Global().Set(JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME, func);
+        if (env.Global().Get(JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME).IsUndefined())
+        {
+            env.Global().Set(JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME, func);
+        }
+
+        JsRuntime::NativeObject::GetFromJavaScript(env).Set(JS_XML_HTTP_REQUEST_CONSTRUCTOR_NAME, func);
     }
 
     XMLHttpRequest::XMLHttpRequest(const Napi::CallbackInfo& info)
@@ -97,7 +129,9 @@ namespace Babylon::Polyfills::Internal
     Napi::Value XMLHttpRequest::GetResponse(const Napi::CallbackInfo&)
     {
         gsl::span<const std::byte> responseBuffer{m_request.ResponseBuffer()};
-        return Napi::ArrayBuffer::New(Env(), const_cast<std::byte*>(responseBuffer.data()), responseBuffer.size());
+        auto arrayBuffer{Napi::ArrayBuffer::New(Env(), responseBuffer.size())};
+        std::memcpy(arrayBuffer.Data(), responseBuffer.data(), arrayBuffer.ByteLength());
+        return std::move(arrayBuffer);
     }
 
     Napi::Value XMLHttpRequest::GetResponseText(const Napi::CallbackInfo&)
@@ -168,22 +202,62 @@ namespace Babylon::Polyfills::Internal
 
     void XMLHttpRequest::Open(const Napi::CallbackInfo& info)
     {
-        m_request.Open(MethodType::StringToEnum(info[0].As<Napi::String>().Utf8Value()), info[1].As<Napi::String>().Utf8Value());
-        SetReadyState(ReadyState::Opened);
+        try
+        {
+            // printfs for debugging CI, will be removed
+            auto inputURL{info[1].As<Napi::String>()};
+            // If the input URL contains any true % characters, encode them as %25
+            auto encodedPercentURL{Napi::String::New(info.Env(), EncodePercent(inputURL.Utf8Value()))};
+            // Decode the input URL to get a completely unencoded URL
+            auto decodedURL{info.Env().Global().Get("decodeURI").As<Napi::Function>().Call({encodedPercentURL})};
+            // Re-encode the URL to make sure that every illegal character is encoded
+            auto finalURL{info.Env().Global().Get("encodeURI").As<Napi::Function>().Call({decodedURL}).As<Napi::String>()};
+            m_request.Open(MethodType::StringToEnum(info[0].As<Napi::String>().Utf8Value()), finalURL.Utf8Value());
+            SetReadyState(ReadyState::Opened);
+        }
+        catch (const std::exception& e)
+        {
+            // If we have a parse error, catch and rethrow to JavaScript
+            throw Napi::Error::New(info.Env(), std::string{"Error parsing URL scheme: "} + e.what());
+        }
+        catch (...)
+        {
+            throw Napi::Error::New(info.Env(), "Unknown error parsing URL scheme");
+        }
     }
 
-    void XMLHttpRequest::Send(const Napi::CallbackInfo& /*info*/)
+    void XMLHttpRequest::Send(const Napi::CallbackInfo& info)
     {
-        m_request.SendAsync().then(m_runtimeScheduler, arcana::cancellation::none(), [this]() {
+        if (m_readyState != ReadyState::Opened)
+        {
+            throw Napi::Error::New(info.Env(), "XMLHttpRequest must be opened before it can be sent");
+            return;
+        }
+        m_request.SendAsync().then(m_runtimeScheduler, arcana::cancellation::none(), [env{info.Env()}, this](arcana::expected<void, std::exception_ptr> result) {
+            if (result.has_error())
+            {
+                Napi::Error::New(env, result.error()).ThrowAsJavaScriptException();
+                return;
+            }
+
             SetReadyState(ReadyState::Done);
+            RaiseEvent(EventType::LoadEnd);
+
+            // Assume the XMLHttpRequest will only be used for a single request and clear the event handlers.
+            // Single use seems to be the standard pattern, and we need to release our strong refs to event handlers.
+            m_eventHandlerRefs.clear();
         });
     }
 
     void XMLHttpRequest::SetReadyState(ReadyState readyState)
     {
         m_readyState = readyState;
+        RaiseEvent(EventType::ReadyStateChange);
+    }
 
-        auto it = m_eventHandlerRefs.find(EventType::ReadyStateChange);
+    void XMLHttpRequest::RaiseEvent(const char* eventType)
+    {
+        auto it = m_eventHandlerRefs.find(eventType);
         if (it != m_eventHandlerRefs.end())
         {
             const auto& eventHandlerRefs = it->second;

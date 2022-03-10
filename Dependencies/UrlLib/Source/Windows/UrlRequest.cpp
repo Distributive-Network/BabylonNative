@@ -1,5 +1,6 @@
 #include <UrlLib/UrlLib.h>
 #include <Unknwn.h>
+#include <PathCch.h>
 #include <arcana/threading/task.h>
 #include <arcana/threading/task_conversions.h>
 #include <robuffer.h>
@@ -22,6 +23,19 @@ namespace UrlLib
                 default:
                     throw std::runtime_error("Unsupported method");
             }
+        }
+
+        winrt::hstring GetInstalledLocation()
+        {
+#ifdef WIN32
+            WCHAR modulePath[4096];
+            DWORD result{::GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath))};
+            winrt::check_bool(result != 0 && result != std::size(modulePath));
+            winrt::check_hresult(PathCchRemoveFileSpec(modulePath, ARRAYSIZE(modulePath)));
+            return modulePath;
+#else
+            return ApplicationModel::Package::Current().InstalledLocation().Path;
+#endif
         }
 
         std::wstring GetLocalPath(Foundation::Uri url)
@@ -48,7 +62,7 @@ namespace UrlLib
         void Open(UrlMethod method, std::string url)
         {
             m_method = method;
-            m_url = std::move(url);
+            m_uri = Foundation::Uri{winrt::to_hstring(url)};
         }
 
         UrlResponseType ResponseType() const
@@ -63,66 +77,75 @@ namespace UrlLib
 
         arcana::task<void, std::exception_ptr> SendAsync()
         {
-            Foundation::Uri url{winrt::to_hstring(m_url)};
+            try
+            {
+                if (m_uri.SchemeName() == L"app")
+                {
+                    return arcana::create_task<std::exception_ptr>(Storage::StorageFolder::GetFolderFromPathAsync(GetInstalledLocation()))
+                        .then(arcana::inline_scheduler, m_cancellationSource, [this, m_uri{m_uri}](Storage::StorageFolder folder) {
+                            return arcana::create_task<std::exception_ptr>(folder.GetFileAsync(GetLocalPath(m_uri)));
+                        })
+                        .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::StorageFile file) {
+                            return LoadFileAsync(file);
+                        });
+                }
+                else if (m_uri.SchemeName() == L"file")
+                {
+                    return arcana::create_task<std::exception_ptr>(Storage::StorageFile::GetFileFromPathAsync(GetLocalPath(m_uri)))
+                        .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::StorageFile file) {
+                            return LoadFileAsync(file);
+                        });
+                }
+                else
+                {
+                    Web::Http::HttpRequestMessage requestMessage;
+                    requestMessage.RequestUri(m_uri);
+                    requestMessage.Method(ConvertHttpMethod(m_method));
 
-            if (url.SchemeName() == L"app")
-            {
-                return arcana::create_task<std::exception_ptr>(ApplicationModel::Package::Current().InstalledLocation().GetFileAsync(GetLocalPath(url)))
-                    .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::StorageFile file) {
-                        return LoadFileAsync(file);
-                    });
-            }
-            else if (url.SchemeName() == L"file")
-            {
-                return arcana::create_task<std::exception_ptr>(Storage::StorageFile::GetFileFromPathAsync(GetLocalPath(url)))
-                    .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::StorageFile file) {
-                        return LoadFileAsync(file);
-                    });
-            }
-            else
-            {
-                Web::Http::HttpRequestMessage requestMessage;
-                requestMessage.RequestUri(url);
-                requestMessage.Method(ConvertHttpMethod(m_method));
-
-                Web::Http::HttpClient client;
-                return arcana::create_task<std::exception_ptr>(client.SendRequestAsync(requestMessage))
-                    .then(arcana::inline_scheduler, m_cancellationSource, [this](Web::Http::HttpResponseMessage responseMessage)
-                    {
-                        m_statusCode = static_cast<UrlStatusCode>(responseMessage.StatusCode());
-                        if (!responseMessage.IsSuccessStatusCode())
+                    Web::Http::HttpClient client;
+                    return arcana::create_task<std::exception_ptr>(client.SendRequestAsync(requestMessage))
+                        .then(arcana::inline_scheduler, m_cancellationSource, [this](Web::Http::HttpResponseMessage responseMessage)
                         {
-                            return arcana::task_from_result<std::exception_ptr>();
-                        }
+                            m_statusCode = static_cast<UrlStatusCode>(responseMessage.StatusCode());
+                            if (!responseMessage.IsSuccessStatusCode())
+                            {
+                                return arcana::task_from_result<std::exception_ptr>();
+                            }
 
-                        m_responseUrl = winrt::to_string(responseMessage.RequestMessage().RequestUri().RawUri());
+                            m_responseUrl = winrt::to_string(responseMessage.RequestMessage().RequestUri().RawUri());
 
-                        switch (m_responseType)
-                        {
-                            case UrlResponseType::String:
+                            switch (m_responseType)
                             {
-                                return arcana::create_task<std::exception_ptr>(responseMessage.Content().ReadAsStringAsync())
-                                    .then(arcana::inline_scheduler, m_cancellationSource, [this](winrt::hstring string)
-                                    {
-                                        m_responseString = winrt::to_string(string);
-                                        m_statusCode = UrlStatusCode::Ok;
-                                    });
+                                case UrlResponseType::String:
+                                {
+                                    return arcana::create_task<std::exception_ptr>(responseMessage.Content().ReadAsStringAsync())
+                                        .then(arcana::inline_scheduler, m_cancellationSource, [this](winrt::hstring string)
+                                        {
+                                            m_responseString = winrt::to_string(string);
+                                            m_statusCode = UrlStatusCode::Ok;
+                                        });
+                                }
+                                case UrlResponseType::Buffer:
+                                {
+                                    return arcana::create_task<std::exception_ptr>(responseMessage.Content().ReadAsBufferAsync())
+                                        .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::Streams::IBuffer buffer)
+                                        {
+                                            m_responseBuffer = std::move(buffer);
+                                            m_statusCode = UrlStatusCode::Ok;
+                                        });
+                                }
+                                default:
+                                {
+                                    throw std::runtime_error{"Invalid response type"};
+                                }
                             }
-                            case UrlResponseType::Buffer:
-                            {
-                                return arcana::create_task<std::exception_ptr>(responseMessage.Content().ReadAsBufferAsync())
-                                    .then(arcana::inline_scheduler, m_cancellationSource, [this](Storage::Streams::IBuffer buffer)
-                                    {
-                                        m_responseBuffer = std::move(buffer);
-                                        m_statusCode = UrlStatusCode::Ok;
-                                    });
-                            }
-                            default:
-                            {
-                                throw std::runtime_error{"Invalid response type"};
-                            }
-                        }
-                    });
+                        });
+                }
+            }
+            catch (winrt::hresult_error)
+            {
+                // Catch WinRT exceptions, but retain the default status code of 0 to indicate a client side error.
+                return arcana::task_from_result<std::exception_ptr>();
             }
         }
 
@@ -143,10 +166,14 @@ namespace UrlLib
 
         gsl::span<const std::byte> ResponseBuffer() const
         {
-            std::byte* bytes;
-            auto bufferByteAccess = m_responseBuffer.as<::Windows::Storage::Streams::IBufferByteAccess>();
-            winrt::check_hresult(bufferByteAccess->Buffer(reinterpret_cast<byte**>(&bytes)));
-            return {bytes, gsl::narrow_cast<std::ptrdiff_t>(m_responseBuffer.Length())};
+            if (m_responseBuffer)
+            {
+                std::byte* bytes;
+                auto bufferByteAccess = m_responseBuffer.as<::Windows::Storage::Streams::IBufferByteAccess>();
+                winrt::check_hresult(bufferByteAccess->Buffer(reinterpret_cast<byte**>(&bytes)));
+                return {bytes, gsl::narrow_cast<std::ptrdiff_t>(m_responseBuffer.Length())};
+            }
+            return {};
         }
 
     private:
@@ -181,7 +208,7 @@ namespace UrlLib
         arcana::cancellation_source m_cancellationSource{};
         UrlResponseType m_responseType{UrlResponseType::String};
         UrlMethod m_method{UrlMethod::Get};
-        std::string m_url{};
+        Foundation::Uri m_uri{nullptr};
         UrlStatusCode m_statusCode{UrlStatusCode::None};
         std::string m_responseUrl{};
         std::string m_responseString{};

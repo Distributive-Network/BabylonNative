@@ -1,17 +1,19 @@
 #include "App.h"
 
+#include <Babylon/Graphics.h>
 #include <Babylon/ScriptLoader.h>
 #include <Babylon/Plugins/NativeEngine.h>
-#include <Babylon/Plugins/NativeWindow.h>
+#include <Babylon/Plugins/NativeOptimizations.h>
 #include <Babylon/Plugins/NativeXr.h>
 #include <Babylon/Polyfills/Console.h>
 #include <Babylon/Polyfills/Window.h>
 #include <Babylon/Polyfills/XMLHttpRequest.h>
+#include <Babylon/Polyfills/Canvas.h>
 
 #include <pplawait.h>
 #include <winrt/Windows.ApplicationModel.h>
 
-#include <windows.ui.core.h>
+#include <winrt/windows.ui.core.h>
 
 using namespace Windows::ApplicationModel;
 using namespace Windows::ApplicationModel::Core;
@@ -103,7 +105,15 @@ void App::Run()
 {
     while (!m_windowClosed)
     {
-        CoreWindow::GetForCurrentThread()->Dispatcher->ProcessEvents(CoreProcessEventsOption::ProcessOneAndAllPending);
+        if (m_graphics)
+        {
+            m_update->Finish();
+            m_graphics->FinishRenderingCurrentFrame();
+            m_graphics->StartRenderingCurrentFrame();
+            m_update->Start();
+        }
+
+        CoreWindow::GetForCurrentThread()->Dispatcher->ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
     }
 }
 
@@ -112,13 +122,16 @@ void App::Run()
 // class is torn down while the app is in the foreground.
 void App::Uninitialize()
 {
-    m_inputBuffer.reset();
-
-    if (m_runtime)
+    if (m_graphics)
     {
-        m_runtime.reset();
-        Babylon::Plugins::NativeEngine::DeinitializeGraphics();
+        m_update->Finish();
+        m_graphics->FinishRenderingCurrentFrame();
     }
+
+    m_chromeDevTools.reset();
+    m_nativeInput = {};
+    m_runtime.reset();
+    m_graphics.reset();
 }
 
 // Application lifecycle event handlers.
@@ -140,70 +153,6 @@ void App::OnActivated(CoreApplicationView^ applicationView, IActivatedEventArgs^
     RestartRuntime(applicationView->CoreWindow->Bounds);
 }
 
-void App::RestartRuntime(Windows::Foundation::Rect bounds)
-{
-    Uninitialize();
-
-    // Initialize the runtime.
-    m_runtime = std::make_unique<Babylon::AppRuntime>();
-
-    // Initialize NativeWindow plugin.
-    DisplayInformation^ displayInformation = DisplayInformation::GetForCurrentView();
-    m_displayScale = static_cast<float>(displayInformation->RawPixelsPerViewPixel);
-    size_t width = static_cast<size_t>(bounds.Width * m_displayScale);
-    size_t height = static_cast<size_t>(bounds.Height * m_displayScale);
-    auto* windowPtr = reinterpret_cast<ABI::Windows::UI::Core::ICoreWindow*>(CoreWindow::GetForCurrentThread());
-    m_runtime->Dispatch([&runtime = m_runtime, &inputBuffer = m_inputBuffer, windowPtr, width, height](Napi::Env env)
-    {
-        Babylon::Polyfills::Console::Initialize(env, [](const char* message, auto)
-        {
-            OutputDebugStringA(message);
-        });
-
-        Babylon::Polyfills::Window::Initialize(env);
-        Babylon::Polyfills::XMLHttpRequest::Initialize(env);
-
-        Babylon::Plugins::NativeWindow::Initialize(env, windowPtr, width, height);
-
-        // Initialize NativeEngine plugin.
-        Babylon::Plugins::NativeEngine::InitializeGraphics(windowPtr, width, height);
-        Babylon::Plugins::NativeEngine::Initialize(env);
-
-        // Initialize NativeXr plugin.
-        Babylon::Plugins::NativeXr::Initialize(env);
-
-        auto& jsRuntime = Babylon::JsRuntime::GetFromJavaScript(env);
-        inputBuffer = std::make_unique<InputManager::InputBuffer>(jsRuntime);
-        InputManager::Initialize(jsRuntime, *inputBuffer);
-    });
-
-    Babylon::ScriptLoader loader{*m_runtime};
-    loader.Eval("document = {}", "");
-    loader.LoadScript("app:///Scripts/ammo.js");
-    loader.LoadScript("app:///Scripts/recast.js");
-    loader.LoadScript("app:///Scripts/babylon.max.js");
-    loader.LoadScript("app:///Scripts/babylon.glTF2FileLoader.js");
-    loader.LoadScript("app:///Scripts/babylonjs.materials.js");
-
-    if (m_files == nullptr)
-    {
-        loader.LoadScript("app:///Scripts/experience.js");
-    }
-    else
-    {
-        for (unsigned int idx = 0; idx < m_files->Size; idx++)
-        {
-            auto file{static_cast<Windows::Storage::IStorageFile^>(m_files->GetAt(idx))};
-
-            // There is no built-in way to convert a local file path to a url in UWP, but
-            // Foundation::Uri works with a url constructed using "file:///" with a local path.
-            loader.LoadScript("file:///" + winrt::to_string(file->Path->Data()));
-        }
-
-        loader.LoadScript("app:///Scripts/playground_runner.js");
-    }
-}
-
 void App::OnSuspending(Platform::Object^ sender, SuspendingEventArgs^ args)
 {
     // Save app state after requesting a deferral. Holding a deferral
@@ -211,7 +160,15 @@ void App::OnSuspending(Platform::Object^ sender, SuspendingEventArgs^ args)
     // aware that a deferral may not be held indefinitely. After about five seconds,
     // the app will be forced to exit.
     auto deferral = args->SuspendingOperation->GetDeferral();
+
+    if (m_graphics)
+    {
+        m_update->Finish();
+        m_graphics->FinishRenderingCurrentFrame();
+    }
+
     m_runtime->Suspend();
+
     deferral->Complete();
 }
 
@@ -220,8 +177,13 @@ void App::OnResuming(Platform::Object^ sender, Platform::Object^ args)
     // Restore any data or state that was unloaded on suspend. By default, data
     // and state are persisted when resuming from suspend. Note that this event
     // does not occur if the app was previously terminated.
-
     m_runtime->Resume();
+
+    if (m_graphics)
+    {
+        m_graphics->StartRenderingCurrentFrame();
+        m_update->Start();
+    }
 }
 
 // Window event handlers.
@@ -230,10 +192,7 @@ void App::OnWindowSizeChanged(CoreWindow^ /*sender*/, WindowSizeChangedEventArgs
 {
     size_t width = static_cast<size_t>(args->Size.Width * m_displayScale);
     size_t height = static_cast<size_t>(args->Size.Height * m_displayScale);
-    m_runtime->Dispatch([width, height](Napi::Env env)
-    {
-        Babylon::Plugins::NativeWindow::UpdateSize(env, width, height);
-    });
+    m_graphics->UpdateSize(width, height);
 }
 
 void App::OnVisibilityChanged(CoreWindow^ sender, VisibilityChangedEventArgs^ args)
@@ -244,31 +203,33 @@ void App::OnVisibilityChanged(CoreWindow^ sender, VisibilityChangedEventArgs^ ar
 void App::OnWindowClosed(CoreWindow^ sender, CoreWindowEventArgs^ args)
 {
     m_windowClosed = true;
-    m_runtime.reset();
+    Uninitialize();
 }
 
 void App::OnPointerMoved(CoreWindow^, PointerEventArgs^ args)
 {
-    if (m_inputBuffer != nullptr)
+    if (m_nativeInput != nullptr)
     {
         const auto& point = args->CurrentPoint->RawPosition;
-        m_inputBuffer->SetPointerPosition(static_cast<int>(point.X), static_cast<int>(point.Y));
+        m_nativeInput->MouseMove(static_cast<int>(point.X), static_cast<int>(point.Y));
     }
 }
 
-void App::OnPointerPressed(CoreWindow^, PointerEventArgs^)
+void App::OnPointerPressed(CoreWindow^, PointerEventArgs^ args)
 {
-    if (m_inputBuffer != nullptr)
+    if (m_nativeInput != nullptr)
     {
-        m_inputBuffer->SetPointerDown(true);
+        const auto& point = args->CurrentPoint->RawPosition;
+        m_nativeInput->MouseDown(0, static_cast<int>(point.X), static_cast<int>(point.Y));
     }
 }
 
-void App::OnPointerReleased(CoreWindow^, PointerEventArgs^)
+void App::OnPointerReleased(CoreWindow^, PointerEventArgs^ args)
 {
-    if (m_inputBuffer != nullptr)
+    if (m_nativeInput != nullptr)
     {
-        m_inputBuffer->SetPointerDown(false);
+        const auto& point = args->CurrentPoint->RawPosition;
+        m_nativeInput->MouseUp(0, static_cast<int>(point.X), static_cast<int>(point.Y));
     }
 }
 
@@ -299,4 +260,82 @@ void App::OnDisplayContentsInvalidated(DisplayInformation^ sender, Object^ args)
 {
     // TODO: Implement.
     //m_deviceResources->ValidateDevice();
+}
+
+void App::RestartRuntime(Windows::Foundation::Rect bounds)
+{
+    Uninitialize();
+
+    DisplayInformation^ displayInformation = DisplayInformation::GetForCurrentView();
+    m_displayScale = static_cast<float>(displayInformation->RawPixelsPerViewPixel);
+    size_t width = static_cast<size_t>(bounds.Width * m_displayScale);
+    size_t height = static_cast<size_t>(bounds.Height * m_displayScale);
+    auto* window = reinterpret_cast<winrt::Windows::UI::Core::ICoreWindow*>(CoreWindow::GetForCurrentThread());
+
+    Babylon::WindowConfiguration graphicsConfig{};
+    graphicsConfig.Window = window;
+    graphicsConfig.Width = width;
+    graphicsConfig.Height = height;
+    m_graphics = Babylon::Graphics::CreateGraphics(graphicsConfig);
+    m_update = std::make_unique<Babylon::Graphics::Update>(m_graphics->GetUpdate("update"));
+    m_graphics->StartRenderingCurrentFrame();
+    m_update->Start();
+
+    m_runtime = std::make_unique<Babylon::AppRuntime>();
+
+    m_runtime->Dispatch([this](Napi::Env env) {
+        m_graphics->AddToJavaScript(env);
+
+        Babylon::Polyfills::Console::Initialize(env, [](const char* message, auto) {
+            OutputDebugStringA(message);
+        });
+
+        Babylon::Polyfills::Window::Initialize(env);
+
+        Babylon::Polyfills::XMLHttpRequest::Initialize(env);
+
+        Babylon::Plugins::NativeEngine::Initialize(env);
+
+        Babylon::Plugins::NativeOptimizations::Initialize(env);
+
+        m_nativeCanvas = std::make_unique <Babylon::Polyfills::Canvas>(Babylon::Polyfills::Canvas::Initialize(env));
+
+        Babylon::Plugins::NativeXr::Initialize(env);
+
+        m_nativeInput = &Babylon::Plugins::NativeInput::CreateForJavaScript(env);
+
+        m_chromeDevTools = std::make_unique<Babylon::Plugins::ChromeDevTools>(Babylon::Plugins::ChromeDevTools::Initialize(env));
+        if (m_chromeDevTools->SupportsInspector())
+        {
+            m_chromeDevTools->StartInspector(5643, "BabylonNative Playground");
+        }
+    });
+
+    Babylon::ScriptLoader loader{*m_runtime};
+    loader.Eval("document = {}", "");
+    loader.LoadScript("app:///Scripts/ammo.js");
+    // Commenting out recast.js for now as v8jsi is incompatible with asm.js.
+    // loader.LoadScript("app:///Scripts/recast.js");
+    loader.LoadScript("app:///Scripts/babylon.max.js");
+    loader.LoadScript("app:///Scripts/babylonjs.loaders.js");
+    loader.LoadScript("app:///Scripts/babylonjs.materials.js");
+    loader.LoadScript("app:///Scripts/babylon.gui.js");
+
+    if (m_files == nullptr)
+    {
+        loader.LoadScript("app:///Scripts/experience.js");
+    }
+    else
+    {
+        for (unsigned int idx = 0; idx < m_files->Size; idx++)
+        {
+            auto file{static_cast<Windows::Storage::IStorageFile^>(m_files->GetAt(idx))};
+
+            // There is no built-in way to convert a local file path to a url in UWP, but
+            // Foundation::Uri works with a url constructed using "file:///" with a local path.
+            loader.LoadScript("file:///" + winrt::to_string(file->Path->Data()));
+        }
+
+        loader.LoadScript("app:///Scripts/playground_runner.js");
+    }
 }

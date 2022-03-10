@@ -33,13 +33,10 @@ JsErrorCode JsCopyString(_In_ JsValueRef value, _Out_opt_ char* buffer, _In_ siz
   size_t stringLength;
   CHECK_JSRT_ERROR_CODE(JsStringToPointer(value, &stringValue, &stringLength));
 
+  int result = ::WideCharToMultiByte(codePage, 0, stringValue, static_cast<int>(stringLength), buffer, static_cast<int>(bufferSize), nullptr, nullptr);
+  assert(result != 0 || stringLength == 0);
   if (length != nullptr) {
-    *length = stringLength;
-  }
-
-  if (buffer != nullptr) {
-    int result = ::WideCharToMultiByte(codePage, 0, stringValue, static_cast<int>(stringLength), buffer, static_cast<int>(bufferSize), nullptr, nullptr);
-    assert(result != 0);
+    *length = result;
   }
 
   return JsErrorCode::JsNoError;
@@ -374,6 +371,7 @@ static napi_status SetErrorCode(napi_env env, JsValueRef error, napi_value code,
 
 napi_status ConcludeDeferred(napi_env env, napi_deferred deferred, const char* property, napi_value result) {
   // We do not check if property is OK, because that's not coming from outside.
+  CHECK_ENV(env);
   CHECK_ARG(env, deferred);
   CHECK_ARG(env, result);
 
@@ -1593,6 +1591,7 @@ napi_status napi_get_value_string_utf16(napi_env env,
 napi_status napi_coerce_to_bool(napi_env env,
                                 napi_value v,
                                 napi_value* result) {
+  CHECK_ENV(env);
   CHECK_ARG(env, result);
   JsValueRef value = reinterpret_cast<JsValueRef>(v);
   CHECK_JSRT(env,
@@ -2355,6 +2354,7 @@ napi_status napi_reject_deferred(napi_env env,
 napi_status napi_is_promise(napi_env env,
                             napi_value promise,
                             bool* is_promise) {
+  CHECK_ENV(env);
   CHECK_ARG(env, promise);
   CHECK_ARG(env, is_promise);
 
@@ -2370,6 +2370,7 @@ napi_status napi_is_promise(napi_env env,
 napi_status napi_run_script(napi_env env,
                             napi_value script,
                             napi_value* result) {
+  CHECK_ENV(env);
   CHECK_ARG(env, script);
   CHECK_ARG(env, result);
 
@@ -2387,6 +2388,7 @@ napi_status napi_run_script(napi_env env,
                             napi_value script,
                             const char* source_url,
                             napi_value* result) {
+  CHECK_ENV(env);
   CHECK_ARG(env, script);
   CHECK_ARG(env, result);
   JsValueRef scriptVar = reinterpret_cast<JsValueRef>(script);
@@ -2411,6 +2413,7 @@ napi_status napi_add_finalizer(napi_env env,
 napi_status napi_adjust_external_memory(napi_env env,
                                         int64_t change_in_bytes,
                                         int64_t* adjusted_value) {
+  CHECK_ENV(env);
   CHECK_ARG(env, adjusted_value);
 
   // TODO(jackhorton): Determine if Chakra needs or is able to do anything here

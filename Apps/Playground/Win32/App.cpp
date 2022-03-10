@@ -6,17 +6,22 @@
 #include <Windowsx.h>
 #include <Shlwapi.h>
 #include <filesystem>
-
-#include <Shared/InputManager.h>
+#include <stdio.h>
 
 #include <Babylon/AppRuntime.h>
+#include <Babylon/Graphics.h>
 #include <Babylon/ScriptLoader.h>
+#include <Babylon/Plugins/NativeCapture.h>
 #include <Babylon/Plugins/NativeEngine.h>
-#include <Babylon/Plugins/NativeWindow.h>
+#include <Babylon/Plugins/NativeOptimizations.h>
+#include <Babylon/Plugins/ChromeDevTools.h>
 #include <Babylon/Plugins/NativeXr.h>
+#include <Babylon/Plugins/NativeCamera.h>
+#include <Babylon/Plugins/NativeInput.h>
 #include <Babylon/Polyfills/Console.h>
 #include <Babylon/Polyfills/Window.h>
 #include <Babylon/Polyfills/XMLHttpRequest.h>
+#include <Babylon/Polyfills/Canvas.h>
 
 #define MAX_LOADSTRING 100
 
@@ -25,7 +30,12 @@ HINSTANCE hInst;                     // current instance
 WCHAR szTitle[MAX_LOADSTRING];       // The title bar text
 WCHAR szWindowClass[MAX_LOADSTRING]; // the main window class name
 std::unique_ptr<Babylon::AppRuntime> runtime{};
-std::unique_ptr<InputManager::InputBuffer> inputBuffer{};
+std::unique_ptr<Babylon::Graphics> graphics{};
+Babylon::Plugins::NativeInput* nativeInput{};
+std::unique_ptr<Babylon::Graphics::Update> update{};
+std::unique_ptr<Babylon::Plugins::ChromeDevTools> chromeDevTools{};
+std::unique_ptr<Babylon::Polyfills::Canvas> nativeCanvas{};
+bool minimized{false};
 
 // Forward declarations of functions included in this code module:
 ATOM MyRegisterClass(HINSTANCE hInstance);
@@ -35,13 +45,6 @@ INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
 namespace
 {
-    std::filesystem::path GetModulePath()
-    {
-        char buffer[1024];
-        ::GetModuleFileNameA(nullptr, buffer, ARRAYSIZE(buffer));
-        return std::filesystem::path{buffer};
-    }
-
     std::string GetUrlFromPath(const std::filesystem::path& path)
     {
         char url[1024];
@@ -78,70 +81,93 @@ namespace
 
     void Uninitialize()
     {
-        inputBuffer.reset();
-
-        if (runtime)
+        if (graphics)
         {
-            runtime.reset();
-            Babylon::Plugins::NativeEngine::DeinitializeGraphics();
+            update->Finish();
+            graphics->FinishRenderingCurrentFrame();
         }
+
+        chromeDevTools.reset();
+        nativeInput = {};
+        runtime.reset();
+        nativeCanvas.reset();
+        update.reset();
+        graphics.reset();
     }
 
     void RefreshBabylon(HWND hWnd)
     {
         Uninitialize();
 
-        runtime = std::make_unique<Babylon::AppRuntime>();
-
         RECT rect;
-        if (!GetWindowRect(hWnd, &rect))
+        if (!GetClientRect(hWnd, &rect))
         {
             return;
         }
 
-        // Initialize console plugin.
-        runtime->Dispatch([rect, hWnd](Napi::Env env) {
+        auto width = static_cast<size_t>(rect.right - rect.left);
+        auto height = static_cast<size_t>(rect.bottom - rect.top);
+
+        Babylon::WindowConfiguration graphicsConfig{};
+        graphicsConfig.Window = hWnd;
+        graphicsConfig.Width = width;
+        graphicsConfig.Height = height;
+
+        graphics = Babylon::Graphics::CreateGraphics(graphicsConfig);
+        update = std::make_unique<Babylon::Graphics::Update>(graphics->GetUpdate("update"));
+        graphics->StartRenderingCurrentFrame();
+        update->Start();
+
+        runtime = std::make_unique<Babylon::AppRuntime>();
+
+        runtime->Dispatch([](Napi::Env env) {
+            graphics->AddToJavaScript(env);
+
             Babylon::Polyfills::Console::Initialize(env, [](const char* message, auto) {
                 OutputDebugStringA(message);
             });
 
             Babylon::Polyfills::Window::Initialize(env);
+
             Babylon::Polyfills::XMLHttpRequest::Initialize(env);
+            nativeCanvas = std::make_unique <Babylon::Polyfills::Canvas>(Babylon::Polyfills::Canvas::Initialize(env));
 
-            // Initialize NativeWindow plugin.
-            auto width = static_cast<size_t>(rect.right - rect.left);
-            auto height = static_cast<size_t>(rect.bottom - rect.top);
-            Babylon::Plugins::NativeWindow::Initialize(env, hWnd, width, height);
-
-            // Initialize NativeEngine plugin.
-            Babylon::Plugins::NativeEngine::InitializeGraphics(hWnd, width, height);
             Babylon::Plugins::NativeEngine::Initialize(env);
+
+            Babylon::Plugins::NativeOptimizations::Initialize(env);
+
+            Babylon::Plugins::NativeCapture::Initialize(env);
+
+            // Initialize Camera 
+            Babylon::Plugins::Camera::Initialize(env);
 
             // Initialize NativeXr plugin.
             Babylon::Plugins::NativeXr::Initialize(env);
 
-            auto& jsRuntime = Babylon::JsRuntime::GetFromJavaScript(env);
-            inputBuffer = std::make_unique<InputManager::InputBuffer>(jsRuntime);
-            InputManager::Initialize(jsRuntime, *inputBuffer);
-        });
+            nativeInput = &Babylon::Plugins::NativeInput::CreateForJavaScript(env);
 
-        // Scripts are copied to the parent of the executable due to CMake issues.
-        // See the CMakeLists.txt comments for more details.
-        std::string scriptsRootUrl = GetUrlFromPath(GetModulePath().parent_path().parent_path() / "Scripts");
+            chromeDevTools = std::make_unique<Babylon::Plugins::ChromeDevTools>(Babylon::Plugins::ChromeDevTools::Initialize(env));
+            if (chromeDevTools->SupportsInspector())
+            {
+                chromeDevTools->StartInspector(5643, "BabylonNative Playground");
+            }
+        });
 
         Babylon::ScriptLoader loader{*runtime};
         loader.Eval("document = {}", "");
-        loader.LoadScript(scriptsRootUrl + "/ammo.js");
-        loader.LoadScript(scriptsRootUrl + "/recast.js");
-        loader.LoadScript(scriptsRootUrl + "/babylon.max.js");
-        loader.LoadScript(scriptsRootUrl + "/babylon.glTF2FileLoader.js");
-        loader.LoadScript(scriptsRootUrl + "/babylonjs.materials.js");
-        loader.LoadScript(scriptsRootUrl + "/meshwriter.min.js");
+        loader.LoadScript("app:///Scripts/ammo.js");
+        // Commenting out recast.js for now because v8jsi is incompatible with asm.js.
+        // loader.LoadScript("app:///Scripts/recast.js");
+        loader.LoadScript("app:///Scripts/babylon.max.js");
+        loader.LoadScript("app:///Scripts/babylonjs.loaders.js");
+        loader.LoadScript("app:///Scripts/babylonjs.materials.js");
+        loader.LoadScript("app:///Scripts/babylon.gui.js");
+        loader.LoadScript("app:///Scripts/meshwriter.min.js");
 
         std::vector<std::string> scripts = GetCommandLineArguments();
         if (scripts.empty())
         {
-            loader.LoadScript(scriptsRootUrl + "/experience.js");
+            loader.LoadScript("app:///Scripts/experience.js");
         }
         else
         {
@@ -150,15 +176,13 @@ namespace
                 loader.LoadScript(GetUrlFromPath(script));
             }
 
-            loader.LoadScript(scriptsRootUrl + "/playground_runner.js");
+            loader.LoadScript("app:///Scripts/playground_runner.js");
         }
     }
 
     void UpdateWindowSize(size_t width, size_t height)
     {
-        runtime->Dispatch([width, height](Napi::Env env) {
-            Babylon::Plugins::NativeWindow::UpdateSize(env, width, height);
-        });
+        graphics->UpdateSize(width, height);
     }
 }
 
@@ -169,8 +193,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
-
-    // TODO: Place code here.
 
     // Initialize global strings
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
@@ -185,15 +207,37 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_PLAYGROUNDWIN32));
 
-    MSG msg;
+    MSG msg{};
 
     // Main message loop:
-    while (GetMessage(&msg, nullptr, 0, 0))
+    while (msg.message != WM_QUIT)
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        BOOL result;
+
+        if (minimized)
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            result = GetMessage(&msg, nullptr, 0, 0);
+        }
+        else
+        {
+            if (graphics)
+            {
+                update->Finish();
+                graphics->FinishRenderingCurrentFrame();
+                graphics->StartRenderingCurrentFrame();
+                update->Start();
+            }
+
+            result = PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE) && msg.message != WM_QUIT;
+        }
+
+        if (result)
+        {
+            if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
         }
     }
 
@@ -274,11 +318,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             if ((wParam & 0xFFF0) == SC_MINIMIZE)
             {
+                if (graphics)
+                {
+                    update->Finish();
+                    graphics->FinishRenderingCurrentFrame();
+                }
+
                 runtime->Suspend();
+
+                minimized = true;
             }
             else if ((wParam & 0xFFF0) == SC_RESTORE)
             {
-                runtime->Resume();
+                if (minimized)
+                {
+                    runtime->Resume();
+
+                    minimized = false;
+
+                    if (graphics)
+                    {
+                        graphics->StartRenderingCurrentFrame();
+                        update->Start();
+                    }
+                }
             }
             DefWindowProc(hWnd, message, wParam, lParam);
             break;
@@ -300,16 +363,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             break;
         }
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            BeginPaint(hWnd, &ps);
-            EndPaint(hWnd, &ps);
-            break;
-        }
         case WM_SIZE:
         {
-            if (runtime != nullptr)
+            if (graphics)
             {
                 auto width = static_cast<size_t>(LOWORD(lParam));
                 auto height = static_cast<size_t>(HIWORD(lParam));
@@ -333,26 +389,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         case WM_MOUSEMOVE:
         {
-            if (inputBuffer != nullptr)
+            if (nativeInput != nullptr)
             {
-                inputBuffer->SetPointerPosition(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                nativeInput->MouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             }
             break;
         }
         case WM_LBUTTONDOWN:
         {
             SetCapture(hWnd);
-            if (inputBuffer != nullptr)
+            if (nativeInput != nullptr)
             {
-                inputBuffer->SetPointerDown(true);
+                nativeInput->MouseDown(0, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             }
             break;
         }
         case WM_LBUTTONUP:
         {
-            if (inputBuffer != nullptr)
+            if (nativeInput != nullptr)
             {
-                inputBuffer->SetPointerDown(false);
+                nativeInput->MouseUp(0, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             }
             ReleaseCapture();
             break;

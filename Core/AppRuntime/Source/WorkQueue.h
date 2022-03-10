@@ -5,6 +5,8 @@
 #include <napi/env.h>
 
 #include <future>
+#include <functional>
+#include <exception>
 
 namespace Babylon
 {
@@ -17,8 +19,7 @@ namespace Babylon
         template<typename CallableT>
         void Append(CallableT callable)
         {
-            std::scoped_lock lock{m_appendMutex};
-            m_task = m_task.then(m_dispatcher, m_cancelSource, [this, callable = std::move(callable)]() mutable {
+            m_dispatcher.queue([this, callable = std::move(callable)]() {
                 callable(m_env.value());
             });
         }
@@ -30,12 +31,9 @@ namespace Babylon
     private:
         std::optional<Napi::Env> m_env{};
 
-        std::mutex m_appendMutex{};
-
         std::optional<std::scoped_lock<std::mutex>> m_suspensionLock{};
 
         arcana::cancellation_source m_cancelSource{};
-        arcana::task<void, std::exception_ptr> m_task = arcana::task_from_result<std::exception_ptr>();
         arcana::manual_dispatcher<128> m_dispatcher{};
 
         std::thread m_thread;

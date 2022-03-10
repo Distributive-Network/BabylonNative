@@ -1,12 +1,16 @@
 #pragma once
 
+#include "NativeDataStream.h"
+#include "PerFrameValue.h"
 #include "ShaderCompiler.h"
-#include "BgfxCallback.h"
+#include "VertexArray.h"
 
 #include <Babylon/JsRuntime.h>
 #include <Babylon/JsRuntimeScheduler.h>
 
-#include <NativeWindow.h>
+#include <GraphicsImpl.h>
+#include <BgfxCallback.h>
+#include <FrameBuffer.h>
 
 #include <napi/napi.h>
 
@@ -17,322 +21,49 @@
 
 #include <gsl/gsl>
 
-#include <assert.h>
-
-#include <arcana/containers/weak_table.h>
 #include <arcana/threading/cancellation.h>
 #include <unordered_map>
 
 namespace Babylon
 {
-    class ClearState final
-    {
-    public:
-        void UpdateColor(float r, float g, float b, float a)
-        {
-            const bool needToUpdate = r != Red || g != Green || b != Blue || a != Alpha;
-            if (needToUpdate)
-            {
-                Red = r;
-                Green = g;
-                Blue = b;
-                Alpha = a;
-                Update();
-            }
-        }
-
-        void UpdateFlags(const Napi::CallbackInfo& info)
-        {
-            const auto flags = static_cast<uint16_t>(info[0].As<Napi::Number>().Uint32Value());
-            Flags = flags;
-            Update();
-        }
-
-        void UpdateDepth(const Napi::CallbackInfo& info)
-        {
-            const auto depth = info[0].As<Napi::Number>().FloatValue();
-            const bool needToUpdate = Depth != depth;
-            if (needToUpdate)
-            {
-                Depth = depth;
-                Update();
-            }
-        }
-
-        void UpdateStencil(const Napi::CallbackInfo& info)
-        {
-            const auto stencil = static_cast<uint8_t>(info[0].As<Napi::Number>().Int32Value());
-            const bool needToUpdate = Stencil != stencil;
-            if (needToUpdate)
-            {
-                Stencil = stencil;
-                Update();
-            }
-        }
-
-        arcana::weak_table<std::function<void()>>::ticket AddUpdateCallback(std::function<void()> callback)
-        {
-            return m_callbacks.insert(std::move(callback));
-        }
-
-        void Update()
-        {
-            m_callbacks.apply_to_all([](std::function<void()>& callback) {
-                callback();
-            });
-        }
-
-        uint32_t Color() const
-        {
-            uint32_t color = 0x0;
-            color += static_cast<uint8_t>(Red * std::numeric_limits<uint8_t>::max());
-            color = color << 8;
-            color += static_cast<uint8_t>(Green * std::numeric_limits<uint8_t>::max());
-            color = color << 8;
-            color += static_cast<uint8_t>(Blue * std::numeric_limits<uint8_t>::max());
-            color = color << 8;
-            color += static_cast<uint8_t>(Alpha * std::numeric_limits<uint8_t>::max());
-            return color;
-        }
-
-        float Red{68.f / 255.f};
-        float Green{51.f / 255.f};
-        float Blue{85.f / 255.f};
-        float Alpha{1.f};
-        float Depth{1.f};
-        uint16_t Flags{BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH};
-        uint8_t Stencil{0};
-
-    private:
-        arcana::weak_table<std::function<void()>> m_callbacks{};
-    };
-
-    class ViewClearState final
-    {
-    public:
-        ViewClearState(uint16_t viewId, ClearState& clearState)
-            : m_viewId{viewId} 
-            , m_clearState{clearState}
-            , m_callbackTicket{m_clearState.AddUpdateCallback([this]() { Update(); })}
-        {
-        }
-
-        void UpdateColor(float r, float g, float b, float a = 1.f)
-        {
-            m_clearState.UpdateColor(r, g, b, a);
-        }
-
-        void UpdateColor(const Napi::CallbackInfo& info)
-        {
-            const auto r = info[0].As<Napi::Number>().FloatValue();
-            const auto g = info[1].As<Napi::Number>().FloatValue();
-            const auto b = info[2].As<Napi::Number>().FloatValue();
-            const auto a = info[3].IsUndefined() ? 1.f : info[3].As<Napi::Number>().FloatValue();
-            m_clearState.UpdateColor(r, g, b, a);
-        }
-
-        void UpdateFlags(const Napi::CallbackInfo& info)
-        {
-            m_clearState.UpdateFlags(info);
-        }
-
-        void UpdateDepth(const Napi::CallbackInfo& info)
-        {
-            m_clearState.UpdateDepth(info);
-        }
-
-        void UpdateStencil(const Napi::CallbackInfo& info)
-        {
-            m_clearState.UpdateStencil(info);
-        }
-
-        void UpdateViewId(uint16_t viewId)
-        {
-            m_viewId = viewId;
-            Update();
-        }
-
-    private:
-
-        void Update() const
-        {
-            bgfx::setViewClear(m_viewId, m_clearState.Flags, m_clearState.Color(), m_clearState.Depth, m_clearState.Stencil);
-            // discard any previous set state
-            bgfx::discard();
-            bgfx::touch(m_viewId);
-        }
-
-        uint16_t m_viewId{};
-        ClearState& m_clearState;
-        arcana::weak_table<std::function<void()>>::ticket m_callbackTicket;
-    };
-
-    struct FrameBufferData final
-    {
-    private:
-        std::unique_ptr<ClearState> m_clearState{};
-
-    public:
-        FrameBufferData(bgfx::FrameBufferHandle frameBuffer, uint16_t viewId, uint16_t width, uint16_t height)
-            : m_clearState{std::make_unique<ClearState>()}
-            , FrameBuffer{frameBuffer}
-            , ViewId{viewId}
-            , ViewClearState{ViewId, *m_clearState}
-            , Width{width}
-            , Height{height}
-        {
-            assert(ViewId < bgfx::getCaps()->limits.maxViews);
-        }
-
-        FrameBufferData(bgfx::FrameBufferHandle frameBuffer, uint16_t viewId, ClearState& clearState, uint16_t width, uint16_t height)
-            : m_clearState{}
-            , FrameBuffer{frameBuffer}
-            , ViewId{viewId}
-            , ViewClearState{ViewId, clearState}
-            , Width{width}
-            , Height{height}
-        {
-            assert(ViewId < bgfx::getCaps()->limits.maxViews);
-        }
-
-        FrameBufferData(FrameBufferData&) = delete;
-
-        ~FrameBufferData()
-        {
-            bgfx::destroy(FrameBuffer);
-        }
-
-        void UseViewId(uint16_t viewId)
-        {
-            ViewId = viewId;
-            ViewClearState.UpdateViewId(ViewId);
-        }
-
-        void SetUpView(uint16_t viewId)
-        {
-            bgfx::setViewFrameBuffer(viewId, FrameBuffer);
-            UseViewId(viewId);
-            bgfx::setViewRect(ViewId, 0, 0, Width, Height);
-        }
-
-        bgfx::FrameBufferHandle FrameBuffer{bgfx::kInvalidHandle};
-        bgfx::ViewId ViewId{};
-        Babylon::ViewClearState ViewClearState;
-        uint16_t Width{};
-        uint16_t Height{};
-    };
-
-    struct FrameBufferManager final
-    {
-        FrameBufferManager()
-        {
-            m_boundFrameBuffer = m_backBuffer = new FrameBufferData(BGFX_INVALID_HANDLE, GetNewViewId(), bgfx::getStats()->width, bgfx::getStats()->height);
-        }
-
-        FrameBufferData* CreateNew(bgfx::FrameBufferHandle frameBufferHandle, uint16_t width, uint16_t height)
-        {
-            return new FrameBufferData(frameBufferHandle, GetNewViewId(), width, height);
-        }
-
-        FrameBufferData* CreateNew(bgfx::FrameBufferHandle frameBufferHandle, ClearState& clearState, uint16_t width, uint16_t height)
-        {
-            return new FrameBufferData(frameBufferHandle, GetNewViewId(), clearState, width, height);
-        }
-
-        void Bind(FrameBufferData* data)
-        {
-            m_boundFrameBuffer = data;
-
-            // TODO: Consider doing this only on bgfx::reset(); the effects of this call don't survive reset, but as
-            // long as there's no reset this doesn't technically need to be called every time the frame buffer is bound.
-            m_boundFrameBuffer->SetUpView(GetNewViewId());
-
-            // bgfx::setTexture()? Why?
-            // TODO: View order?
-        }
-
-        FrameBufferData& GetBound() const
-        {
-            return *m_boundFrameBuffer;
-        }
-
-        void Unbind(FrameBufferData* data)
-        {
-            assert(m_boundFrameBuffer == data);
-            (void)data;
-            m_boundFrameBuffer = m_backBuffer;
-        }
-
-        uint16_t GetNewViewId()
-        {
-            m_nextId++;
-            assert(m_nextId < bgfx::getCaps()->limits.maxViews);
-            return m_nextId;
-        }
-
-        void Reset()
-        {
-            m_nextId = 0;
-        }
-
-    private:
-        FrameBufferData* m_boundFrameBuffer{nullptr};
-        FrameBufferData* m_backBuffer{nullptr};
-        uint16_t m_nextId{0};
-    };
-
     struct UniformInfo final
     {
+        UniformInfo(uint8_t stage, bgfx::UniformHandle handle, size_t maxElementLength)
+            : Stage{stage}
+            , Handle{handle}
+            , MaxElementLength{maxElementLength}
+        {
+        }
+
         uint8_t Stage{};
-        // uninitilized bgfx resource is BGFX_INVALID_HANDLE. 0 can be a valid handle.
         bgfx::UniformHandle Handle{bgfx::kInvalidHandle};
-    };
-
-    struct TextureData final
-    {
-        ~TextureData()
-        {
-            if (bgfx::isValid(Handle))
-            {
-                bgfx::destroy(Handle);
-            }
-        }
-
-        bgfx::TextureHandle Handle{bgfx::kInvalidHandle};
-        uint32_t Width{0};
-        uint32_t Height{0};
-        uint32_t Flags{0};
-        uint8_t AnisotropicLevel{0};
-    };
-
-    struct ImageData final
-    {
-        ~ImageData()
-        {
-            if (Image)
-            {
-                bimg::imageFree(Image.get());
-            }
-        }
-        std::unique_ptr<bimg::ImageContainer> Image;
+        size_t MaxElementLength{};
     };
 
     struct ProgramData final
     {
         ProgramData() = default;
+        ProgramData(ProgramData&& other) = delete;
         ProgramData(const ProgramData&) = delete;
-        ProgramData(ProgramData&&) = delete;
+        ProgramData& operator=(ProgramData&& other) = delete;
+        ProgramData& operator=(const ProgramData& other) = delete;
 
         ~ProgramData()
         {
-            bgfx::destroy(Program);
+            Dispose();
         }
 
-        std::unordered_map<std::string, uint32_t> AttributeLocations{};
-        std::unordered_map<std::string, UniformInfo> VertexUniformNameToInfo{};
-        std::unordered_map<std::string, UniformInfo> FragmentUniformNameToInfo{};
+        void Dispose()
+        {
+            if (!Disposed && bgfx::isValid(Handle))
+            {
+                bgfx::destroy(Handle);
+            }
+            Disposed = true;
+        }
 
-        bgfx::ProgramHandle Program{};
+        bgfx::ProgramHandle Handle{bgfx::kInvalidHandle};
+        bool Disposed{false};
 
         struct UniformValue
         {
@@ -341,160 +72,169 @@ namespace Babylon
         };
 
         std::unordered_map<uint16_t, UniformValue> Uniforms{};
+        std::unordered_map<std::string, uint16_t> UniformNameToIndex{};
+        std::unordered_map<uint16_t, UniformInfo> UniformInfos{};
+        std::unordered_map<std::string, uint32_t> VertexAttributeLocations{};
 
         void SetUniform(bgfx::UniformHandle handle, gsl::span<const float> data, size_t elementLength = 1)
         {
             UniformValue& value = Uniforms[handle.idx];
+
+            const auto itUniformInfo{UniformInfos.find(handle.idx)};
+
+            if (itUniformInfo != UniformInfos.end())
+            {
+                elementLength = std::min(itUniformInfo->second.MaxElementLength, elementLength);
+            }
+
             value.Data.assign(data.begin(), data.end());
             value.ElementLength = static_cast<uint16_t>(elementLength);
         }
     };
 
-    class IndexBufferData;
-    class VertexBufferData;
-
-    struct VertexArray final
-    {
-        struct IndexBuffer
-        {
-            const IndexBufferData* data{};
-        };
-
-        IndexBuffer indexBuffer{};
-
-        struct VertexBuffer
-        {
-            const VertexBufferData* data{};
-            uint32_t startVertex{};
-            bgfx::VertexLayoutHandle vertexLayoutHandle{};
-        };
-
-        std::vector<VertexBuffer> vertexBuffers{};
-    };
-
     class NativeEngine final : public Napi::ObjectWrap<NativeEngine>
     {
         static constexpr auto JS_CLASS_NAME = "_NativeEngine";
-        static constexpr auto JS_ENGINE_CONSTRUCTOR_NAME = "Engine";
+        static constexpr auto JS_CONSTRUCTOR_NAME = "Engine";
 
     public:
         NativeEngine(const Napi::CallbackInfo& info);
-        NativeEngine(const Napi::CallbackInfo& info, Plugins::Internal::NativeWindow& nativeWindow);
+        NativeEngine(const Napi::CallbackInfo& info, JsRuntime& runtime);
         ~NativeEngine();
 
-        static void InitializeWindow(void* nativeWindowPtr, uint32_t width, uint32_t height);
-        static void DeinitializeWindow();
-        static void Initialize(Napi::Env);
-
-        FrameBufferManager& GetFrameBufferManager();
-        void Dispatch(std::function<void()>);
-        void EndFrame();
+        static void Initialize(Napi::Env env);
 
     private:
         void Dispose();
 
         void Dispose(const Napi::CallbackInfo& info);
-        Napi::Value GetEngine(const Napi::CallbackInfo& info); // TODO: Hack, temporary method. Remove as part of the change to get rid of NapiBridge.
         void RequestAnimationFrame(const Napi::CallbackInfo& info);
         Napi::Value CreateVertexArray(const Napi::CallbackInfo& info);
-        void DeleteVertexArray(const Napi::CallbackInfo& info);
-        void BindVertexArray(const Napi::CallbackInfo& info);
+        void DeleteVertexArray(NativeDataStream::Reader& data);
+        void BindVertexArray(NativeDataStream::Reader& data);
         Napi::Value CreateIndexBuffer(const Napi::CallbackInfo& info);
-        void DeleteIndexBuffer(const Napi::CallbackInfo& info);
+        void DeleteIndexBuffer(NativeDataStream::Reader& data);
         void RecordIndexBuffer(const Napi::CallbackInfo& info);
         void UpdateDynamicIndexBuffer(const Napi::CallbackInfo& info);
         Napi::Value CreateVertexBuffer(const Napi::CallbackInfo& info);
-        void DeleteVertexBuffer(const Napi::CallbackInfo& info);
+        void DeleteVertexBuffer(NativeDataStream::Reader& data);
         void RecordVertexBuffer(const Napi::CallbackInfo& info);
         void UpdateDynamicVertexBuffer(const Napi::CallbackInfo& info);
         Napi::Value CreateProgram(const Napi::CallbackInfo& info);
         Napi::Value GetUniforms(const Napi::CallbackInfo& info);
         Napi::Value GetAttributes(const Napi::CallbackInfo& info);
-        void SetProgram(const Napi::CallbackInfo& info);
-        void SetState(const Napi::CallbackInfo& info);
-        void SetZOffset(const Napi::CallbackInfo& info);
-        Napi::Value GetZOffset(const Napi::CallbackInfo& info);
-        void SetDepthTest(const Napi::CallbackInfo& info);
-        Napi::Value GetDepthWrite(const Napi::CallbackInfo& info);
-        void SetDepthWrite(const Napi::CallbackInfo& info);
-        void SetColorWrite(const Napi::CallbackInfo& info);
-        void SetBlendMode(const Napi::CallbackInfo& info);
-        void SetMatrix(const Napi::CallbackInfo& info);
-        void SetInt(const Napi::CallbackInfo& info);
-        void SetIntArray(const Napi::CallbackInfo& info);
-        void SetIntArray2(const Napi::CallbackInfo& info);
-        void SetIntArray3(const Napi::CallbackInfo& info);
-        void SetIntArray4(const Napi::CallbackInfo& info);
-        void SetFloatArray(const Napi::CallbackInfo& info);
-        void SetFloatArray2(const Napi::CallbackInfo& info);
-        void SetFloatArray3(const Napi::CallbackInfo& info);
-        void SetFloatArray4(const Napi::CallbackInfo& info);
-        void SetMatrices(const Napi::CallbackInfo& info);
-        void SetMatrix3x3(const Napi::CallbackInfo& info);
-        void SetMatrix2x2(const Napi::CallbackInfo& info);
-        void SetFloat(const Napi::CallbackInfo& info);
-        void SetFloat2(const Napi::CallbackInfo& info);
-        void SetFloat3(const Napi::CallbackInfo& info);
-        void SetFloat4(const Napi::CallbackInfo& info);
+        void SetProgram(NativeDataStream::Reader& data);
+        void DeleteProgram(NativeDataStream::Reader& data);
+        void SetState(NativeDataStream::Reader& data);
+        void SetZOffset(NativeDataStream::Reader& data);
+        void SetZOffsetUnits(NativeDataStream::Reader& data);
+        void SetDepthTest(NativeDataStream::Reader& data);
+        void SetDepthWrite(NativeDataStream::Reader& data);
+        void SetColorWrite(NativeDataStream::Reader& data);
+        void SetBlendMode(NativeDataStream::Reader& data);
+        void SetMatrix(NativeDataStream::Reader& data);
+        void SetInt(NativeDataStream::Reader& data);
+        void SetIntArray(NativeDataStream::Reader& data);
+        void SetIntArray2(NativeDataStream::Reader& data);
+        void SetIntArray3(NativeDataStream::Reader& data);
+        void SetIntArray4(NativeDataStream::Reader& data);
+        void SetFloatArray(NativeDataStream::Reader& data);
+        void SetFloatArray2(NativeDataStream::Reader& data);
+        void SetFloatArray3(NativeDataStream::Reader& data);
+        void SetFloatArray4(NativeDataStream::Reader& data);
+        void SetMatrices(NativeDataStream::Reader& data);
+        void SetMatrix3x3(NativeDataStream::Reader& data);
+        void SetMatrix2x2(NativeDataStream::Reader& data);
+        void SetFloat(NativeDataStream::Reader& data);
+        void SetFloat2(NativeDataStream::Reader& data);
+        void SetFloat3(NativeDataStream::Reader& data);
+        void SetFloat4(NativeDataStream::Reader& data);
         Napi::Value CreateTexture(const Napi::CallbackInfo& info);
         void LoadTexture(const Napi::CallbackInfo& info);
+        void CopyTexture(const Napi::CallbackInfo& info);
+        void LoadRawTexture(const Napi::CallbackInfo& info);
+        void LoadRawTexture2DArray(const Napi::CallbackInfo& info);
         void LoadCubeTexture(const Napi::CallbackInfo& info);
         void LoadCubeTextureWithMips(const Napi::CallbackInfo& info);
         Napi::Value GetTextureWidth(const Napi::CallbackInfo& info);
         Napi::Value GetTextureHeight(const Napi::CallbackInfo& info);
-        void SetTextureSampling(const Napi::CallbackInfo& info);
-        void SetTextureWrapMode(const Napi::CallbackInfo& info);
-        void SetTextureAnisotropicLevel(const Napi::CallbackInfo& info);
-        void SetTexture(const Napi::CallbackInfo& info);
+        void SetTextureSampling(NativeDataStream::Reader& data);
+        void SetTextureWrapMode(NativeDataStream::Reader& data);
+        void SetTextureAnisotropicLevel(NativeDataStream::Reader& data);
+        void SetTexture(NativeDataStream::Reader& data);
         void DeleteTexture(const Napi::CallbackInfo& info);
         Napi::Value CreateFrameBuffer(const Napi::CallbackInfo& info);
-        void DeleteFrameBuffer(const Napi::CallbackInfo& info);
-        void BindFrameBuffer(const Napi::CallbackInfo& info);
-        void UnbindFrameBuffer(const Napi::CallbackInfo& info);
-        void DrawIndexed(const Napi::CallbackInfo& info);
-        void Draw(const Napi::CallbackInfo& info);
-        void Clear(const Napi::CallbackInfo& info);
-        void ClearColor(const Napi::CallbackInfo& info);
-        void ClearStencil(const Napi::CallbackInfo& info);
-        void ClearDepth(const Napi::CallbackInfo& info);
+        void DeleteFrameBuffer(NativeDataStream::Reader& data);
+        void BindFrameBuffer(NativeDataStream::Reader& data);
+        void UnbindFrameBuffer(NativeDataStream::Reader& data);
+        void DrawIndexed(NativeDataStream::Reader& data);
+        void Draw(NativeDataStream::Reader& data);
+        void Clear(NativeDataStream::Reader& data);
         Napi::Value GetRenderWidth(const Napi::CallbackInfo& info);
         Napi::Value GetRenderHeight(const Napi::CallbackInfo& info);
         void SetViewPort(const Napi::CallbackInfo& info);
-        void GetFramebufferData(const Napi::CallbackInfo& info);
-        Napi::Value GetRenderAPI(const Napi::CallbackInfo& info);
+        Napi::Value GetHardwareScalingLevel(const Napi::CallbackInfo& info);
+        void SetHardwareScalingLevel(const Napi::CallbackInfo& info);
+        Napi::Value CreateImageBitmap(const Napi::CallbackInfo& info);
+        Napi::Value ResizeImageBitmap(const Napi::CallbackInfo& info);
+        void GetFrameBufferData(const Napi::CallbackInfo& info);
+        void SetStencil(NativeDataStream::Reader& data);
+        void SetCommandDataStream(const Napi::CallbackInfo& info);
+        void SubmitCommands(const Napi::CallbackInfo& info);
+        void DrawInternal(bgfx::Encoder* encoder, uint32_t fillMode);
 
-        void UpdateSize(size_t width, size_t height);
+        std::string ProcessShaderCoordinates(const std::string& vertexSource);
 
-        arcana::cancellation_source m_cancelSource{};
+        GraphicsImpl::UpdateToken& GetUpdateToken();
+        FrameBuffer& GetBoundFrameBuffer(bgfx::Encoder& encoder);
 
-        ShaderCompiler m_shaderCompiler;
+        std::shared_ptr<arcana::cancellation_source> m_cancellationSource{};
+
+        ShaderCompiler m_shaderCompiler{};
 
         ProgramData* m_currentProgram{nullptr};
-        arcana::weak_table<std::unique_ptr<ProgramData>> m_programDataCollection{};
 
         JsRuntime& m_runtime;
+        GraphicsImpl& m_graphicsImpl;
+        GraphicsImpl::Update m_update;
+
         JsRuntimeScheduler m_runtimeScheduler;
 
-        bx::DefaultAllocator m_allocator;
-        uint64_t m_engineState;
+        std::optional<GraphicsImpl::UpdateToken> m_updateToken{};
 
-        static inline BgfxCallback s_bgfxCallback{};
-        FrameBufferManager m_frameBufferManager{};
+        void ScheduleRequestAnimationFrameCallbacks();
+        bool m_requestAnimationFrameCallbacksScheduled{};
 
-        Plugins::Internal::NativeWindow::NativeWindow::OnResizeCallbackTicket m_resizeCallbackTicket;
+        bx::DefaultAllocator m_allocator{};
+        uint64_t m_engineState{BGFX_STATE_DEFAULT};
+        uint32_t m_stencilState{BGFX_STENCIL_TEST_ALWAYS | BGFX_STENCIL_FUNC_REF(0) | BGFX_STENCIL_FUNC_RMASK(0xFF) | BGFX_STENCIL_OP_FAIL_S_KEEP | BGFX_STENCIL_OP_FAIL_Z_KEEP | BGFX_STENCIL_OP_PASS_Z_REPLACE};
 
         template<int size, typename arrayType>
-        void SetTypeArrayN(const Napi::CallbackInfo& info);
+        void SetTypeArrayN(const UniformInfo& uniformInfo, const uint32_t elementLength, const arrayType& array);
 
         template<int size>
-        void SetFloatN(const Napi::CallbackInfo& info);
+        void SetIntArrayN(NativeDataStream::Reader& data);
 
         template<int size>
-        void SetMatrixN(const Napi::CallbackInfo& info);
+        void SetFloatArrayN(NativeDataStream::Reader& data);
+
+        template<int size>
+        void SetFloatN(NativeDataStream::Reader& data);
+
+        template<int size>
+        void SetMatrixN(NativeDataStream::Reader& data);
 
         // Scratch vector used for data alignment.
         std::vector<float> m_scratch{};
-        
-        Napi::FunctionReference m_requestAnimationFrameCalback{};
+
+        std::vector<Napi::FunctionReference> m_requestAnimationFrameCallbacks{};
+
+        VertexArray* m_boundVertexArray{};
+        FrameBuffer m_defaultFrameBuffer;
+        FrameBuffer* m_boundFrameBuffer{};
+        PerFrameValue<bool> m_boundFrameBufferNeedsRebinding;
+
+        // TODO: This should be changed to a non-owning ref once multi-update is available.
+        NativeDataStream* m_commandStream{};
     };
 }

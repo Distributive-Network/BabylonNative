@@ -1,6 +1,7 @@
 #include <climits>  // INT_MAX
 #include <cmath>
 #include <algorithm>
+#include <sstream>
 #define NAPI_EXPERIMENTAL
 #include "js_native_api_v8.h"
 #include <napi/js_native_api.h>
@@ -50,6 +51,10 @@
         "Invalid typed array length");                                         \
     (out) = v8::type::New((buffer), (byte_offset), (length));                  \
   } while (0)
+
+#ifndef __clang__
+#pragma warning(disable: 4100 4267)
+#endif
 
 namespace v8impl {
 
@@ -2952,22 +2957,32 @@ napi_status napi_run_script(napi_env env,
 
   auto maybe_script = v8::Script::Compile(context,
       v8::Local<v8::String>::Cast(v8_script));
-  CHECK_MAYBE_EMPTY(env, maybe_script, napi_generic_failure);
 
-  auto script_result =
-      maybe_script.ToLocalChecked()->Run(context);
-  CHECK_MAYBE_EMPTY(env, script_result, napi_generic_failure);
+  if (!maybe_script.IsEmpty()) {
+      auto script_result =
+          maybe_script.ToLocalChecked()->Run(context);
+      if (!script_result.IsEmpty()) {
+          *result = v8impl::JsValueFromV8LocalValue(
+              script_result.ToLocalChecked());
+      }
+  }
 
-  *result = v8impl::JsValueFromV8LocalValue(script_result.ToLocalChecked());
   return GET_RETURN_STATUS(env);
 }
 
 napi_status napi_run_script(napi_env env,
                             napi_value script,
                             const char* source_url,
-                            napi_value* result) {
-  // TODO: figure out what to do with source_url
-  return napi_run_script(env, script, result);
+                            napi_value* result) {    
+    // Append the source URL so V8 can locate the file.
+    std::ostringstream source_url_comment;
+    source_url_comment << std::endl << "//# sourceURL=" << source_url << std::endl;
+    const auto source_url_comment_str = source_url_comment.str();
+
+    const auto v8_script_string = v8::Local<v8::String>::Cast(v8impl::V8LocalValueFromJsValue(script));
+    const auto source_with_comment = v8::String::Concat(env->isolate, v8_script_string, OneByteString(env->isolate, source_url_comment_str.c_str(), source_url_comment_str.size()));
+
+    return napi_run_script(env, v8impl::JsValueFromV8LocalValue(source_with_comment), result);
 }
 
 napi_status napi_add_finalizer(napi_env env,
@@ -3030,10 +3045,16 @@ napi_status napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
   v8::Local<v8::ArrayBuffer> it = value.As<v8::ArrayBuffer>();
   RETURN_STATUS_IF_FALSE(
       env, it->IsExternal(), napi_detachable_arraybuffer_expected);
+#if V8_MAJOR_VERSION > 7 || (V8_MAJOR_VERSION == 7 && V8_MINOR_VERSION >= 4)
   RETURN_STATUS_IF_FALSE(
       env, it->IsDetachable(), napi_detachable_arraybuffer_expected);
 
   it->Detach();
+#else
+  RETURN_STATUS_IF_FALSE(
+      env, it->IsNeuterable(), napi_detachable_arraybuffer_expected);
 
+  it->Neuter();
+#endif
   return napi_clear_last_error(env);
 }

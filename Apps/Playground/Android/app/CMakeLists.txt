@@ -21,8 +21,7 @@ cmake_minimum_required(VERSION 3.13.2)
 project(BabylonNative)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
 set(BABYLON_NATIVE_PLATFORM "Android")
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+set(CMAKE_CXX_STANDARD 17)
 
 if (${ANDROID_JSENGINE_LIBNAME} STREQUAL "jsc")
     set(NAPI_JAVASCRIPT_ENGINE "JavaScriptCore" CACHE STRING "JavaScript engine for N-API.")
@@ -42,14 +41,11 @@ set(BABYLON_NATIVE_PLAYGROUND_DIR "${CMAKE_CURRENT_LIST_DIR}/../..")
 add_subdirectory(${BABYLON_NATIVE_PLAYGROUND_DIR}/../../ ${BABYLON_NATIVE_PLAYGROUND_DIR}/../../build/Android_${CMAKE_ANDROID_ARCH_ABI}/)
 
 add_library(BabylonNativeJNI SHARED
-            src/main/cpp/BabylonNativeJNI.cpp
-            ${BABYLON_NATIVE_PLAYGROUND_DIR}/Shared/InputManager.cpp)
+            src/main/cpp/BabylonNativeJNI.cpp)
 
 target_include_directories(BabylonNativeJNI
         PRIVATE
         ${BABYLON_NATIVE_PLAYGROUND_DIR}/Shared)
-
-add_definitions(-DANDROID_STL=c++_shared)
 
 target_link_libraries(BabylonNativeJNI
         GLESv3
@@ -57,17 +53,17 @@ target_link_libraries(BabylonNativeJNI
         EGL
         log
         -lz
-        AndroidExtensions
         AppRuntime
         NativeEngine
+        NativeInput
         NativeXr
-        NativeWindow
+        NativeOptimizations
         Console
+        Canvas
         Window
         ScriptLoader
-        XMLHttpRequest)
-
-configure_file(
-    "${ANDROID_NDK}/sources/cxx-stl/llvm-libc++/libs/${ANDROID_ABI}/libc++_shared.so"
-    "${CMAKE_CURRENT_LIST_DIR}/src/main/jniLibs/${CMAKE_ANDROID_ARCH_ABI}/libc++_shared.so"
-    COPYONLY)
+        XMLHttpRequest
+        NativeCamera
+        AndroidExtensions
+        ChromeDevTools
+        )

@@ -4,26 +4,37 @@
 #include <signal.h>
 #include <time.h>
 #include <memory>
+#include <optional>
 #include <android/native_window.h> // requires ndk r5 or newer
 #include <android/native_window_jni.h> // requires ndk r5 or newer
 #include <android/log.h>
 
 #include <AndroidExtensions/Globals.h>
 #include <Babylon/AppRuntime.h>
+#include <Babylon/Graphics.h>
 #include <Babylon/ScriptLoader.h>
 #include <Babylon/Plugins/NativeEngine.h>
-#include <Babylon/Plugins/NativeWindow.h>
+#include <Babylon/Plugins/NativeInput.h>
 #include <Babylon/Plugins/NativeXr.h>
+#include <Babylon/Plugins/NativeCamera.h>
+#include <Babylon/Plugins/NativeOptimizations.h>
+#include <Babylon/Plugins/ChromeDevTools.h>
 #include <Babylon/Polyfills/Console.h>
 #include <Babylon/Polyfills/Window.h>
 #include <Babylon/Polyfills/XMLHttpRequest.h>
-#include <InputManager.h>
+#include <Babylon/Polyfills/Canvas.h>
 
 namespace
 {
+    std::unique_ptr<Babylon::Graphics> g_graphics{};
+    std::unique_ptr<Babylon::Graphics::Update> g_update{};
     std::unique_ptr<Babylon::AppRuntime> g_runtime{};
-    std::unique_ptr<InputManager::InputBuffer> g_inputBuffer{};
+    std::unique_ptr<Babylon::Plugins::ChromeDevTools> g_chromeDevTools{};
+    Babylon::Plugins::NativeInput* g_nativeInput{};
     std::unique_ptr<Babylon::ScriptLoader> g_scriptLoader{};
+    std::optional<Babylon::Plugins::NativeXr> g_nativeXr{};
+    std::unique_ptr<Babylon::Polyfills::Canvas> nativeCanvas{};
+    bool g_isXrActive{};
 }
 
 extern "C"
@@ -36,10 +47,20 @@ extern "C"
     JNIEXPORT void JNICALL
     Java_BabylonNative_Wrapper_finishEngine(JNIEnv* env, jclass clazz)
     {
+        if (g_graphics)
+        {
+            g_update->Finish();
+            g_graphics->FinishRenderingCurrentFrame();
+        }
+
+        g_chromeDevTools.reset();
+        g_nativeXr.reset();
         g_scriptLoader.reset();
-        g_inputBuffer.reset();
+        g_nativeInput = {};
         g_runtime.reset();
-        Babylon::Plugins::NativeEngine::DeinitializeGraphics();
+        g_graphics.reset();
+
+        g_isXrActive = false;
     }
 
     JNIEXPORT void JNICALL
@@ -47,8 +68,6 @@ extern "C"
     {
         if (!g_runtime)
         {
-            g_runtime = std::make_unique<Babylon::AppRuntime>();
-
             JavaVM* javaVM{};
             if (env->GetJavaVM(&javaVM) != JNI_OK)
             {
@@ -61,8 +80,21 @@ extern "C"
             int32_t width  = ANativeWindow_getWidth(window);
             int32_t height = ANativeWindow_getHeight(window);
 
-            g_runtime->Dispatch([javaVM, window, width, height](Napi::Env env)
+            Babylon::WindowConfiguration graphicsConfig{};
+            graphicsConfig.Window = window;
+            graphicsConfig.Width = static_cast<size_t>(width);
+            graphicsConfig.Height = static_cast<size_t>(height);
+            g_graphics = Babylon::Graphics::CreateGraphics(graphicsConfig);
+            g_update = std::make_unique<Babylon::Graphics::Update>(g_graphics->GetUpdate("update"));
+            g_graphics->StartRenderingCurrentFrame();
+            g_update->Start();
+
+            g_runtime = std::make_unique<Babylon::AppRuntime>();
+
+            g_runtime->Dispatch([](Napi::Env env)
             {
+                g_graphics->AddToJavaScript(env);
+
                 Babylon::Polyfills::Console::Initialize(env, [](const char* message, Babylon::Polyfills::Console::LogLevel level)
                 {
                     switch (level)
@@ -79,20 +111,25 @@ extern "C"
                     }
                 });
 
-                Babylon::Plugins::NativeWindow::Initialize(env, window, width, height);
-
-                Babylon::Plugins::NativeEngine::InitializeGraphics(window, width, height);
                 Babylon::Plugins::NativeEngine::Initialize(env);
+                Babylon::Plugins::NativeOptimizations::Initialize(env);
 
-                Babylon::Plugins::NativeXr::Initialize(env);
+                g_nativeXr.emplace(Babylon::Plugins::NativeXr::Initialize(env));
+                g_nativeXr->SetSessionStateChangedCallback([](bool isXrActive){ g_isXrActive = isXrActive; });
+                
+                g_nativeInput = &Babylon::Plugins::NativeInput::CreateForJavaScript(env);
 
+                Babylon::Plugins::Camera::Initialize(env, true);
                 Babylon::Polyfills::Window::Initialize(env);
+
                 Babylon::Polyfills::XMLHttpRequest::Initialize(env);
+                nativeCanvas = std::make_unique <Babylon::Polyfills::Canvas>(Babylon::Polyfills::Canvas::Initialize(env));
 
-                auto& jsRuntime = Babylon::JsRuntime::GetFromJavaScript(env);
-
-                g_inputBuffer = std::make_unique<InputManager::InputBuffer>(jsRuntime);
-                InputManager::Initialize(jsRuntime, *g_inputBuffer);
+                g_chromeDevTools = std::make_unique<Babylon::Plugins::ChromeDevTools>(Babylon::Plugins::ChromeDevTools::Initialize(env));
+                if (g_chromeDevTools->SupportsInspector())
+                {
+                    g_chromeDevTools->StartInspector(5643, "BabylonNative Playground");
+                }
             });
 
             g_scriptLoader = std::make_unique<Babylon::ScriptLoader>(*g_runtime);
@@ -100,8 +137,9 @@ extern "C"
             g_scriptLoader->LoadScript("app:///Scripts/ammo.js");
             g_scriptLoader->LoadScript("app:///Scripts/recast.js");
             g_scriptLoader->LoadScript("app:///Scripts/babylon.max.js");
-            g_scriptLoader->LoadScript("app:///Scripts/babylon.glTF2FileLoader.js");
+            g_scriptLoader->LoadScript("app:///Scripts/babylonjs.loaders.js");
             g_scriptLoader->LoadScript("app:///Scripts/babylonjs.materials.js");
+            g_scriptLoader->LoadScript("app:///Scripts/babylon.gui.js");
         }
     }
 
@@ -111,9 +149,13 @@ extern "C"
         if (g_runtime)
         {
             ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
-            g_runtime->Dispatch([window, width, height](Napi::Env env)
-            {
-                Babylon::Plugins::NativeEngine::Reinitialize(env, window, static_cast<size_t>(width), static_cast<size_t>(height));
+            g_runtime->Dispatch([window, width = static_cast<size_t>(width), height = static_cast<size_t>(height)](auto env) {
+                Babylon::WindowConfiguration graphicsConfig{};
+                graphicsConfig.Window = window;
+                graphicsConfig.Width = width;
+                graphicsConfig.Height = height;
+                g_graphics->UpdateWindow(graphicsConfig);
+                g_graphics->UpdateSize(width, height);
             });
         }
     }
@@ -185,12 +227,52 @@ extern "C"
     }
 
     JNIEXPORT void JNICALL
-    Java_BabylonNative_Wrapper_setTouchInfo(JNIEnv* env, jclass clazz, jfloat x, jfloat y, jboolean down)
+    Java_BabylonNative_Wrapper_setTouchInfo(JNIEnv* env, jclass clazz, jfloat x, jfloat y, jboolean buttonAction, jint buttonValue)
     {
-        if (g_inputBuffer != nullptr)
+        if (g_nativeInput != nullptr)
         {
-            g_inputBuffer->SetPointerPosition(x, y);
-            g_inputBuffer->SetPointerDown(down);
+            if (buttonAction)
+            {
+                if (buttonValue == 1)
+                    g_nativeInput->TouchDown(0, x, y);
+                else
+                    g_nativeInput->TouchUp(0, x, y);
+            }
+            else {
+                g_nativeInput->TouchMove(0, x, y);
+            }
         }
+    }
+
+    JNIEXPORT void JNICALL
+    Java_BabylonNative_Wrapper_renderFrame(JNIEnv* env, jclass clazz)
+    {
+        if (g_graphics)
+        {
+            g_update->Finish();
+            g_graphics->FinishRenderingCurrentFrame();
+            g_graphics->StartRenderingCurrentFrame();
+            g_update->Start();
+        }
+    }
+
+    JNIEXPORT void JNICALL
+    Java_BabylonNative_Wrapper_xrSurfaceChanged(JNIEnv* env, jclass clazz, jobject surface)
+    {
+        if (g_nativeXr)
+        {
+            ANativeWindow* window{};
+            if (surface)
+            {
+                window = ANativeWindow_fromSurface(env, surface);
+            }
+            g_nativeXr->UpdateWindow(window);
+        }
+    }
+
+    JNIEXPORT jboolean JNICALL
+    Java_BabylonNative_Wrapper_isXRActive(JNIEnv* env, jclass clazz)
+    {
+        return g_isXrActive;
     }
 }

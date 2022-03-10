@@ -18,7 +18,15 @@ if (project.hasProperty("JSEngine")) {
     }
 }
 
+def graphics_api = "OpenGL"
 def platformVersion = 21
+if (project.hasProperty("GRAPHICS_API")) {
+    graphics_api = project.property("GRAPHICS_API")
+    if ("${graphics_api}" == "Vulkan" ) {
+        platformVersion = 24 // minimal version to get Vulkan
+    }
+}
+
 def arcore_libpath = "${buildDir}/arcore-native"
 
 configurations { natives }
@@ -27,37 +35,47 @@ android {
     compileSdkVersion 28
 
     defaultConfig {
-        applicationId 'com.android.babylonnative.playground'
+        applicationId "com.android.babylonnative.playground"
         minSdkVersion "${platformVersion}"
         targetSdkVersion 28
         externalNativeBuild {
             cmake {
-                abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
-                arguments '-DANDROID_STL=c++_static',
-                        '-DENABLE_GLSLANG_BINARIES=OFF',
-                        '-DSPIRV_CROSS_CLI=OFF',
-                        "-DARCORE_LIBPATH=${arcore_libpath}/jni",
-                        "-DANDROID_JSENGINE_LIBPATH=${jsEngineLibDir}",
-                        "-DANDROID_JSENGINE_LIBNAME=${jsEngineLibName}",
-                        "-DANDROID_JSENGINE_INCPATH=${jsEngineIncDir}"
+                abiFilters "arm64-v8a", "armeabi-v7a", "x86", "x86_64"
+                arguments "-DANDROID_STL=c++_shared",
+                    "-DENABLE_PCH=OFF",
+                    "-DGRAPHICS_API=${graphics_api}",
+                    "-DARCORE_LIBPATH=${arcore_libpath}/jni",
+                    "-DANDROID_JSENGINE_LIBPATH=${jsEngineLibDir}",
+                    "-DANDROID_JSENGINE_LIBNAME=${jsEngineLibName}",
+                    "-DANDROID_JSENGINE_INCPATH=${jsEngineIncDir}"
             }
         }
         ndk {
-            abiFilters "arm64-v8a", "armeabi-v7a", "x86"
+            if (project.hasProperty("ARM64Only")) {
+                abiFilters "arm64-v8a"
+            } else {
+                abiFilters "arm64-v8a", "armeabi-v7a", "x86"
+            }
+            if (project.hasProperty("NDK_VERSION")) {
+                def NDKVersion = project.property("NDK_VERSION")
+                ndkVersion  "${NDK_VERSION}"
+            }
         }
     }
 
     buildTypes {
         release {
-            minifyEnabled = false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'),
-                          'proguard-rules.pro'
+            // Caution! In production, you need to generate your own keystore file.
+            // see https://reactnative.dev/docs/signed-apk-android.
+            signingConfig signingConfigs.debug
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 
     externalNativeBuild {
         cmake {
-            version '3.13.2+'
+            version '3.19.0+'
             path 'CMakeLists.txt'
         }
     }
@@ -97,7 +115,31 @@ tasks.whenTaskAdded { task ->
 task copyFiles {
     copy
     {
-        from '../../../BabylonScripts'
+        from '../../../node_modules/babylonjs'
+        include "babylon.max.js"
+        into 'src/main/assets/Scripts'
+    }
+    copy
+    {
+        from '../../../node_modules/babylonjs-loaders'
+        include "babylonjs.loaders.js"
+        into 'src/main/assets/Scripts'
+    }
+    copy
+    {
+        from '../../../node_modules/babylonjs-materials'
+        include "babylonjs.materials.js"
+        into 'src/main/assets/Scripts'
+    }
+    copy
+    {
+        from '../../../node_modules/babylonjs-gui'
+        include "babylon.gui.js"
+        into 'src/main/assets/Scripts'
+    }
+    copy
+    {
+        from '../../../Dependencies'
         include "*.js"
         into 'src/main/assets/Scripts'
     }
@@ -113,11 +155,11 @@ repositories {
     mavenLocal()
     maven {
         // Android JSC is installed from npm
-        url "$rootDir/node_modules/jsc-android/dist"
+        url "$rootDir/../../node_modules/jsc-android/dist"
     }
     maven {
         // Android V8 is installed from npm
-        url "$rootDir/node_modules/v8-android/dist"
+        url "$rootDir/../../node_modules/v8-android/dist"
     }
     google()
     jcenter()
@@ -170,13 +212,13 @@ tasks.whenTaskAdded { task ->
 task copyFilesJSHeaders {
     copy
     {
-        from "${rootDir}/node_modules/jsc-android/dist/include"
+        from "${rootDir}/../../node_modules/jsc-android/dist/include"
         include "*"
         into "${jsEngineBaseDir}/include/JavaScriptCore"
     }
     copy
     {
-        from "${rootDir}/node_modules/v8-android/dist/include"
+        from "${rootDir}/../../node_modules/v8-android/dist/include"
         include "**/*"
         into "${jsEngineIncDir}"
     }

@@ -18,7 +18,7 @@ public class BabylonView extends FrameLayout implements SurfaceHolder.Callback2,
     private Activity mCurrentActivity;
     private final SurfaceView primarySurfaceView;
     private final SurfaceView xrSurfaceView;
-
+    private final float pixelDensityScale = getResources().getDisplayMetrics().density;
     public BabylonView(Context context, ViewDelegate viewDelegate) {
         this(context, viewDelegate, (Activity)viewDelegate);
     }
@@ -117,7 +117,7 @@ public class BabylonView extends FrameLayout implements SurfaceHolder.Callback2,
      * not normally called or subclassed by clients of BabylonView.
      */
     public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
-        BabylonNative.Wrapper.surfaceChanged(w, h, holder.getSurface());
+        BabylonNative.Wrapper.surfaceChanged((int)(w / this.pixelDensityScale), (int)(h / this.pixelDensityScale), holder.getSurface());
     }
 
     public interface ViewDelegate {
@@ -126,17 +126,21 @@ public class BabylonView extends FrameLayout implements SurfaceHolder.Callback2,
 
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        float mX = event.getX();
-        float mY = event.getY();
-        switch (event.getAction()) {
+        int pointerId = event.getPointerId(event.getActionIndex());
+        float mX = event.getX(event.getActionIndex()) / this.pixelDensityScale;
+        float mY = event.getY(event.getActionIndex()) / this.pixelDensityScale;
+
+        switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                BabylonNative.Wrapper.setTouchInfo(mX, mY, true, 1);
+            case MotionEvent.ACTION_POINTER_DOWN:
+                BabylonNative.Wrapper.setTouchInfo(pointerId, mX, mY, true, 1);
                 break;
             case MotionEvent.ACTION_MOVE:
-                BabylonNative.Wrapper.setTouchInfo(mX, mY, false, 0);
+                BabylonNative.Wrapper.setTouchInfo(pointerId, mX, mY, false, 0);
                 break;
             case MotionEvent.ACTION_UP:
-                BabylonNative.Wrapper.setTouchInfo(mX, mY, true, 0);
+            case MotionEvent.ACTION_POINTER_UP:
+                BabylonNative.Wrapper.setTouchInfo(pointerId, mX, mY, true, 0);
                 break;
         }
         return true;

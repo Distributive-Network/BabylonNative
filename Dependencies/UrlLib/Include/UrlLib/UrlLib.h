@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string_view>
 #include <arcana/threading/task.h>
 
 namespace UrlLib
@@ -26,12 +27,15 @@ namespace UrlLib
     {
     public:
         UrlRequest();
-
-        UrlRequest(const UrlRequest&);
-
-        UrlRequest(UrlRequest&&);
-
         ~UrlRequest();
+
+        // Copy semantics
+        UrlRequest(const UrlRequest&);
+        UrlRequest& operator=(const UrlRequest&);
+
+        // Move semantics
+        UrlRequest(UrlRequest&&) noexcept;
+        UrlRequest& operator=(UrlRequest&&) noexcept;
 
         void Abort();
 
@@ -45,9 +49,9 @@ namespace UrlLib
 
         UrlStatusCode StatusCode() const;
 
-        gsl::cstring_span<> ResponseUrl() const;
+        std::string_view ResponseUrl() const;
 
-        gsl::cstring_span<> ResponseString() const;
+        std::string_view ResponseString() const;
 
         gsl::span<const std::byte> ResponseBuffer() const;
 

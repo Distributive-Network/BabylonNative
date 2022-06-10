@@ -11,6 +11,7 @@
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb/stb_truetype.h"
+#undef STB_TRUETYPE_IMPLEMENTATION
 #include "Canvas.h"
 #include "Context.h"
 #include "MeasureText.h"
@@ -23,15 +24,15 @@ Most of these context methods are preliminary work. They are currenbly not teste
 */
 namespace Babylon::Polyfills::Internal
 {
-    static constexpr auto JS_CONSTRUCTOR_NAME = "Context";
+    static constexpr auto JS_CONTEXT_CONSTRUCTOR_NAME = "Context";
 
-    Napi::Value Context::CreateInstance(Napi::Env env, NativeCanvas* canvas)
+    void Context::Initialize(Napi::Env env)
     {
-        Napi::HandleScope scope{ env };
+        Napi::HandleScope scope{env};
 
         Napi::Function func = DefineClass(
             env,
-            JS_CONSTRUCTOR_NAME,
+            JS_CONTEXT_CONSTRUCTOR_NAME,
             {
                 InstanceMethod("clearRect", &Context::ClearRect),
                 InstanceMethod("save", &Context::Save),
@@ -74,6 +75,14 @@ namespace Babylon::Polyfills::Internal
                 InstanceAccessor("lineWidth", &Context::GetLineWidth, &Context::SetLineWidth),
                 InstanceAccessor("canvas", &Context::GetCanvas, nullptr)
             });
+        JsRuntime::NativeObject::GetFromJavaScript(env).Set(JS_CONTEXT_CONSTRUCTOR_NAME, func);
+    }
+
+    Napi::Value Context::CreateInstance(Napi::Env env, NativeCanvas* canvas)
+    {
+        Napi::HandleScope scope{ env };
+
+        auto func = JsRuntime::NativeObject::GetFromJavaScript(env).Get(JS_CONTEXT_CONSTRUCTOR_NAME).As<Napi::Function>();
         return func.New({ Napi::External<NativeCanvas>::New(env, canvas)});
     }
 
@@ -81,8 +90,8 @@ namespace Babylon::Polyfills::Internal
         : Napi::ObjectWrap<Context>{info}
         , m_canvas{info[0].As<Napi::External<NativeCanvas>>().Data()}
         , m_nvg{nvgCreate(1)}
-        , m_graphicsImpl{Babylon::GraphicsImpl::GetFromJavaScript(info.Env())}
-        , m_update{m_graphicsImpl.GetUpdate("update")}
+        , m_graphicsContext{m_canvas->GetGraphicsContext()}
+        , m_update{m_graphicsContext.GetUpdate("update")}
         , m_cancellationSource{std::make_shared<arcana::cancellation_source>()}
         , m_runtimeScheduler{Babylon::JsRuntime::GetFromJavaScript(info.Env())}
         , Polyfills::Canvas::Impl::MonitoredResource{Polyfills::Canvas::Impl::GetFromJavaScript(info.Env())}
@@ -132,7 +141,7 @@ namespace Babylon::Polyfills::Internal
         nvgBeginPath(m_nvg);
         nvgRect(m_nvg, left, top, width, height);
 
-        const auto color = StringToColor(m_fillStyle);
+        const auto color = StringToColor(info.Env(), m_fillStyle);
         nvgFillColor(m_nvg, color);
         nvgFill(m_nvg);
         SetDirty();
@@ -143,10 +152,10 @@ namespace Babylon::Polyfills::Internal
         return Napi::Value::From(Env(), m_fillStyle);
     }
 
-    void Context::SetFillStyle(const Napi::CallbackInfo&, const Napi::Value& value)
+    void Context::SetFillStyle(const Napi::CallbackInfo& info, const Napi::Value& value)
     {
         m_fillStyle = value.As<Napi::String>().Utf8Value();
-        const auto color = StringToColor(m_fillStyle);
+        const auto color = StringToColor(info.Env(), m_fillStyle);
         nvgFillColor(m_nvg, color);
         SetDirty();
     }
@@ -156,10 +165,10 @@ namespace Babylon::Polyfills::Internal
         return Napi::Value::From(Env(), m_strokeStyle);
     }
 
-    void Context::SetStrokeStyle(const Napi::CallbackInfo&, const Napi::Value& value)
+    void Context::SetStrokeStyle(const Napi::CallbackInfo& info, const Napi::Value& value)
     {
         m_strokeStyle = value.As<Napi::String>().Utf8Value();
-        auto color = StringToColor(m_strokeStyle);
+        auto color = StringToColor(info.Env(), m_strokeStyle);
         nvgStrokeColor(m_nvg, color);
         SetDirty();
     }
@@ -358,12 +367,12 @@ namespace Babylon::Polyfills::Internal
         arcana::make_task(m_update.Scheduler(), *m_cancellationSource, [this, needClear, cancellationSource{ m_cancellationSource }]() {
             return arcana::make_task(m_runtimeScheduler, *m_cancellationSource, [this, needClear, updateToken{ m_update.GetUpdateToken() }, cancellationSource{ m_cancellationSource }]() {
                 // JS Thread
-                Babylon::FrameBuffer& frameBuffer = m_canvas->GetFrameBuffer();
+                Graphics::FrameBuffer& frameBuffer = m_canvas->GetFrameBuffer();
                 bgfx::Encoder* encoder = m_update.GetUpdateToken().GetEncoder();
                 frameBuffer.Bind(*encoder);
                 if (needClear)
                 {
-                    frameBuffer.Clear(*encoder, BGFX_CLEAR_COLOR, 0, 1.f, 0);
+                    frameBuffer.Clear(*encoder, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.f, 0);
                 }
                 frameBuffer.SetViewPort(*encoder, 0.f, 0.f, 1.f, 1.f);
                 const auto width = m_canvas->GetWidth();

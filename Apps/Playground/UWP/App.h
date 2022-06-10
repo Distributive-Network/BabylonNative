@@ -2,7 +2,7 @@
 
 #include <Babylon/Plugins/NativeInput.h>
 #include <Babylon/AppRuntime.h>
-#include <Babylon/Graphics.h>
+#include <Babylon/Graphics/Device.h>
 #include <Babylon/Plugins/ChromeDevTools.h>
 #include <Babylon/Polyfills/Canvas.h>
 
@@ -32,6 +32,7 @@ private:
     void OnPointerMoved(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::PointerEventArgs^ args);
     void OnPointerPressed(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::PointerEventArgs^ args);
     void OnPointerReleased(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::PointerEventArgs^ args);
+    void OnPointerWheelChanged(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::PointerEventArgs ^ args);
     void OnKeyPressed(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::KeyEventArgs^ args);
 
     // DisplayInformation event handlers.
@@ -41,8 +42,8 @@ private:
 
     void RestartRuntime(Windows::Foundation::Rect bounds);
 
-    std::unique_ptr<Babylon::Graphics> m_graphics{};
-    std::unique_ptr<Babylon::Graphics::Update> m_update{};
+    std::unique_ptr<Babylon::Graphics::Device> m_device{};
+    std::unique_ptr<Babylon::Graphics::DeviceUpdate> m_update{};
     std::unique_ptr<Babylon::AppRuntime> m_runtime{};
     Babylon::Plugins::NativeInput* m_nativeInput{};
     std::unique_ptr<Babylon::Plugins::ChromeDevTools> m_chromeDevTools{};

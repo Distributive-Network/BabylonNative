@@ -7,11 +7,15 @@ namespace UrlLib
     {
     }
 
-    UrlRequest::UrlRequest(const UrlRequest&) = default;
-
-    UrlRequest::UrlRequest(UrlRequest&&) = default;
-
     UrlRequest::~UrlRequest() = default;
+
+    // Copy semantics
+    UrlRequest::UrlRequest(const UrlRequest&) = default;
+    UrlRequest& UrlRequest::operator=(const UrlRequest&) = default;
+
+    // Move semantics
+    UrlRequest::UrlRequest(UrlRequest&&) noexcept = default;
+    UrlRequest& UrlRequest::operator=(UrlRequest&&) noexcept = default;
 
     void UrlRequest::Abort()
     {
@@ -43,12 +47,12 @@ namespace UrlLib
         return m_impl->StatusCode();
     }
 
-    gsl::cstring_span<> UrlRequest::ResponseUrl() const
+    std::string_view UrlRequest::ResponseUrl() const
     {
         return m_impl->ResponseUrl();
     }
 
-    gsl::cstring_span<> UrlRequest::ResponseString() const
+    std::string_view UrlRequest::ResponseString() const
     {
         return m_impl->ResponseString();
     }

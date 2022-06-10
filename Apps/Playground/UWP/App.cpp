@@ -1,6 +1,6 @@
 #include "App.h"
 
-#include <Babylon/Graphics.h>
+#include <Babylon/Graphics/Device.h>
 #include <Babylon/ScriptLoader.h>
 #include <Babylon/Plugins/NativeEngine.h>
 #include <Babylon/Plugins/NativeOptimizations.h>
@@ -31,6 +31,32 @@ int main(Platform::Array<Platform::String^>^)
     auto direct3DApplicationSource = ref new Direct3DApplicationSource();
     CoreApplication::Run(direct3DApplicationSource);
     return 0;
+}
+
+// Helper function to handle mouse button routing
+void ProcessMouseButtons(Babylon::Plugins::NativeInput* m_nativeInput, PointerUpdateKind updateKind, int x, int y)
+{
+    switch (updateKind)
+    {
+        case PointerUpdateKind::LeftButtonPressed:
+            m_nativeInput->MouseDown(Babylon::Plugins::NativeInput::LEFT_MOUSE_BUTTON_ID, x, y);
+            break;
+        case PointerUpdateKind::MiddleButtonPressed:
+            m_nativeInput->MouseDown(Babylon::Plugins::NativeInput::MIDDLE_MOUSE_BUTTON_ID, x, y);
+            break;
+        case PointerUpdateKind::RightButtonPressed:
+            m_nativeInput->MouseDown(Babylon::Plugins::NativeInput::RIGHT_MOUSE_BUTTON_ID, x, y);
+            break;
+        case PointerUpdateKind::LeftButtonReleased:
+            m_nativeInput->MouseUp(Babylon::Plugins::NativeInput::LEFT_MOUSE_BUTTON_ID, x, y);
+            break;
+        case PointerUpdateKind::MiddleButtonReleased:
+            m_nativeInput->MouseUp(Babylon::Plugins::NativeInput::MIDDLE_MOUSE_BUTTON_ID, x, y);
+            break;
+        case PointerUpdateKind::RightButtonReleased:
+            m_nativeInput->MouseUp(Babylon::Plugins::NativeInput::RIGHT_MOUSE_BUTTON_ID, x, y);
+            break;
+    }
 }
 
 IFrameworkView^ Direct3DApplicationSource::CreateView()
@@ -91,6 +117,9 @@ void App::SetWindow(CoreWindow^ window)
     window->PointerReleased +=
         ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(this, &App::OnPointerReleased);
 
+    window->PointerWheelChanged +=
+        ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(this, &App::OnPointerWheelChanged);
+
     window->KeyDown +=
         ref new TypedEventHandler<CoreWindow^, KeyEventArgs^>(this, &App::OnKeyPressed);
 }
@@ -105,11 +134,11 @@ void App::Run()
 {
     while (!m_windowClosed)
     {
-        if (m_graphics)
+        if (m_device)
         {
             m_update->Finish();
-            m_graphics->FinishRenderingCurrentFrame();
-            m_graphics->StartRenderingCurrentFrame();
+            m_device->FinishRenderingCurrentFrame();
+            m_device->StartRenderingCurrentFrame();
             m_update->Start();
         }
 
@@ -122,16 +151,16 @@ void App::Run()
 // class is torn down while the app is in the foreground.
 void App::Uninitialize()
 {
-    if (m_graphics)
+    if (m_device)
     {
         m_update->Finish();
-        m_graphics->FinishRenderingCurrentFrame();
+        m_device->FinishRenderingCurrentFrame();
     }
 
     m_chromeDevTools.reset();
     m_nativeInput = {};
     m_runtime.reset();
-    m_graphics.reset();
+    m_device.reset();
 }
 
 // Application lifecycle event handlers.
@@ -161,10 +190,10 @@ void App::OnSuspending(Platform::Object^ sender, SuspendingEventArgs^ args)
     // the app will be forced to exit.
     auto deferral = args->SuspendingOperation->GetDeferral();
 
-    if (m_graphics)
+    if (m_device)
     {
         m_update->Finish();
-        m_graphics->FinishRenderingCurrentFrame();
+        m_device->FinishRenderingCurrentFrame();
     }
 
     m_runtime->Suspend();
@@ -179,9 +208,9 @@ void App::OnResuming(Platform::Object^ sender, Platform::Object^ args)
     // does not occur if the app was previously terminated.
     m_runtime->Resume();
 
-    if (m_graphics)
+    if (m_device)
     {
-        m_graphics->StartRenderingCurrentFrame();
+        m_device->StartRenderingCurrentFrame();
         m_update->Start();
     }
 }
@@ -192,7 +221,7 @@ void App::OnWindowSizeChanged(CoreWindow^ /*sender*/, WindowSizeChangedEventArgs
 {
     size_t width = static_cast<size_t>(args->Size.Width * m_displayScale);
     size_t height = static_cast<size_t>(args->Size.Height * m_displayScale);
-    m_graphics->UpdateSize(width, height);
+    m_device->UpdateSize(width, height);
 }
 
 void App::OnVisibilityChanged(CoreWindow^ sender, VisibilityChangedEventArgs^ args)
@@ -210,8 +239,26 @@ void App::OnPointerMoved(CoreWindow^, PointerEventArgs^ args)
 {
     if (m_nativeInput != nullptr)
     {
-        const auto& point = args->CurrentPoint->RawPosition;
-        m_nativeInput->MouseMove(static_cast<int>(point.X), static_cast<int>(point.Y));
+        const auto& position = args->CurrentPoint->RawPosition;
+        const auto deviceType = args->CurrentPoint->PointerDevice->PointerDeviceType;
+        const auto deviceSlot = args->CurrentPoint->PointerId;
+        const auto updateKind = args->CurrentPoint->Properties->PointerUpdateKind;
+        const auto x = static_cast<int>(position.X);
+        const auto y = static_cast<int>(position.Y);
+
+        if (deviceType == Windows::Devices::Input::PointerDeviceType::Mouse)
+        {
+            m_nativeInput->MouseMove(x, y);
+
+            if (args->CurrentPoint->IsInContact)
+            {
+                ProcessMouseButtons(m_nativeInput, updateKind, x, y);
+            }
+        }
+        else
+        {
+            m_nativeInput->TouchMove(deviceSlot, x, y);
+        }
     }
 }
 
@@ -219,8 +266,21 @@ void App::OnPointerPressed(CoreWindow^, PointerEventArgs^ args)
 {
     if (m_nativeInput != nullptr)
     {
-        const auto& point = args->CurrentPoint->RawPosition;
-        m_nativeInput->MouseDown(0, static_cast<int>(point.X), static_cast<int>(point.Y));
+        const auto& position = args->CurrentPoint->RawPosition;
+        const auto deviceType = args->CurrentPoint->PointerDevice->PointerDeviceType;
+        const auto deviceSlot = args->CurrentPoint->PointerId;
+        const auto updateKind = args->CurrentPoint->Properties->PointerUpdateKind;
+        const auto x = static_cast<int>(position.X);
+        const auto y = static_cast<int>(position.Y);
+
+        if (deviceType == Windows::Devices::Input::PointerDeviceType::Mouse)
+        {
+            ProcessMouseButtons(m_nativeInput, updateKind, x, y);
+        }
+        else
+        {
+            m_nativeInput->TouchDown(deviceSlot, x, y);
+        }
     }
 }
 
@@ -228,9 +288,27 @@ void App::OnPointerReleased(CoreWindow^, PointerEventArgs^ args)
 {
     if (m_nativeInput != nullptr)
     {
-        const auto& point = args->CurrentPoint->RawPosition;
-        m_nativeInput->MouseUp(0, static_cast<int>(point.X), static_cast<int>(point.Y));
+        const auto& position = args->CurrentPoint->RawPosition;
+        const auto deviceType = args->CurrentPoint->PointerDevice->PointerDeviceType;
+        const auto deviceSlot = args->CurrentPoint->PointerId;
+        const auto updateKind = args->CurrentPoint->Properties->PointerUpdateKind;
+        const auto x = static_cast<int>(position.X);
+        const auto y = static_cast<int>(position.Y);
+
+        if (deviceType == Windows::Devices::Input::PointerDeviceType::Mouse)
+        {
+            ProcessMouseButtons(m_nativeInput, updateKind, x, y);
+        }
+        else
+        {
+            m_nativeInput->TouchUp(deviceSlot, x, y);
+        }
     }
+}
+void App::OnPointerWheelChanged(CoreWindow^, PointerEventArgs^ args)
+{
+    const auto delta = args->CurrentPoint->Properties->MouseWheelDelta;
+    m_nativeInput->MouseWheel(Babylon::Plugins::NativeInput::MOUSEWHEEL_Y_ID, delta);
 }
 
 void App::OnKeyPressed(CoreWindow^ window, KeyEventArgs^ args)
@@ -272,19 +350,19 @@ void App::RestartRuntime(Windows::Foundation::Rect bounds)
     size_t height = static_cast<size_t>(bounds.Height * m_displayScale);
     auto* window = reinterpret_cast<winrt::Windows::UI::Core::ICoreWindow*>(CoreWindow::GetForCurrentThread());
 
-    Babylon::WindowConfiguration graphicsConfig{};
+    Babylon::Graphics::WindowConfiguration graphicsConfig{};
     graphicsConfig.Window = window;
     graphicsConfig.Width = width;
     graphicsConfig.Height = height;
-    m_graphics = Babylon::Graphics::CreateGraphics(graphicsConfig);
-    m_update = std::make_unique<Babylon::Graphics::Update>(m_graphics->GetUpdate("update"));
-    m_graphics->StartRenderingCurrentFrame();
+    m_device = Babylon::Graphics::Device::Create(graphicsConfig);
+    m_update = std::make_unique<Babylon::Graphics::DeviceUpdate>(m_device->GetUpdate("update"));
+    m_device->StartRenderingCurrentFrame();
     m_update->Start();
 
     m_runtime = std::make_unique<Babylon::AppRuntime>();
 
     m_runtime->Dispatch([this](Napi::Env env) {
-        m_graphics->AddToJavaScript(env);
+        m_device->AddToJavaScript(env);
 
         Babylon::Polyfills::Console::Initialize(env, [](const char* message, auto) {
             OutputDebugStringA(message);

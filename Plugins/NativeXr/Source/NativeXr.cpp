@@ -8,8 +8,8 @@
 #include <bx/math.h>
 #include <bgfx/bgfx.h>
 
-#include <FrameBuffer.h>
-#include <GraphicsImpl.h>
+#include <Babylon/Graphics/DeviceContext.h>
+#include <Babylon/Graphics/FrameBuffer.h>
 
 #include <algorithm>
 #include <set>
@@ -392,6 +392,14 @@ namespace Babylon
                 return m_sessionState->Session->TrySetPreferredMeshDetectorOptions(options);
             }
 
+            std::vector<xr::ImageTrackingScore>* GetImageTrackingScores() {
+                return m_sessionState->Session->GetImageTrackingScores();
+            }
+
+            void CreateAugmentedImageDatabase(const std::vector<xr::System::Session::ImageTrackingRequest>& requests) {
+                m_sessionState->Session->CreateAugmentedImageDatabase(requests);
+            }
+
             uintptr_t GetNativeXrContext()
             {
                 return m_system.GetNativeXrContext();
@@ -416,21 +424,21 @@ namespace Babylon
                 void* ColorTexturePointer{nullptr};
                 void* DepthTexturePointer{nullptr};
                 xr::Size ViewTextureSize{};
-                std::vector<FrameBuffer*> FrameBuffers{};
-                std::map<FrameBuffer*, Napi::ObjectReference> JsTextures{};
+                std::vector<Graphics::FrameBuffer*> FrameBuffers{};
+                std::map<Graphics::FrameBuffer*, Napi::ObjectReference> JsTextures{};
                 bool Initialized{false};
             };
 
             struct SessionState final
             {
-                explicit SessionState(GraphicsImpl& graphicsImpl)
-                    : GraphicsImpl{graphicsImpl}
-                    , Update{GraphicsImpl.GetUpdate("update")}
+                explicit SessionState(Graphics::DeviceContext& graphicsContext)
+                    : GraphicsContext{graphicsContext}
+                    , Update{GraphicsContext.GetUpdate("update")}
                 {
                 }
 
-                GraphicsImpl& GraphicsImpl;
-                GraphicsImpl::Update Update;
+                Graphics::DeviceContext& GraphicsContext;
+                Graphics::Update Update;
                 Napi::FunctionReference CreateRenderTexture{};
                 Napi::FunctionReference DestroyRenderTexture{};
                 std::vector<ViewConfiguration*> ActiveViewConfigurations{};
@@ -494,14 +502,14 @@ namespace Babylon
                 return arcana::task_from_error<void>(std::make_exception_ptr(std::runtime_error{"There is already an immersive XR session either currently active or in the process of being set up. There can only be one immersive XR session at a time."}));
             }
 
-            GraphicsImpl& graphicsImpl{GraphicsImpl::GetFromJavaScript(m_env)};
+            Graphics::DeviceContext& context = Graphics::DeviceContext::GetFromJavaScript(m_env);
 
             // Don't try to start a session while it is still ending.
-            m_beginTask.emplace(m_endTask.then(graphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(),
-                [this, thisRef{shared_from_this()}, &graphicsImpl]() {
+            m_beginTask.emplace(m_endTask.then(context.AfterRenderScheduler(), arcana::cancellation::none(),
+                [this, thisRef{shared_from_this()}, &context]() {
                     assert(m_sessionState == nullptr);
 
-                    m_sessionState = std::make_unique<SessionState>(graphicsImpl);
+                    m_sessionState = std::make_unique<SessionState>(context);
 
                     if (!m_system.IsInitialized() &&
                         !m_system.TryInitialize())
@@ -510,7 +518,7 @@ namespace Babylon
                     }
 
                     return xr::System::Session::CreateAsync(m_system, bgfx::getInternalData()->context, bgfx::getInternalData()->commandQueue, [this, thisRef{shared_from_this()}] { return m_windowPtr; })
-                        .then(m_sessionState->GraphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](std::shared_ptr<xr::System::Session> session) {
+                        .then(m_sessionState->GraphicsContext.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](std::shared_ptr<xr::System::Session> session) {
                             m_sessionState->Session = std::move(session);
                             NotifySessionStateChanged(true);
                         });
@@ -536,7 +544,7 @@ namespace Babylon
             m_endTask = m_beginTask->then(arcana::inline_scheduler, arcana::cancellation::none(), [this, thisRef{shared_from_this()}] {
                 // Also don't try to end the session while a frame is in progress.
                 return m_sessionState->FrameTask;
-            }).then(m_sessionState->GraphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](const arcana::expected<void, std::exception_ptr>&) {
+            }).then(m_sessionState->GraphicsContext.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](const arcana::expected<void, std::exception_ptr>&) {
                 assert(m_sessionState != nullptr);
                 assert(m_sessionState->Session != nullptr);
                 assert(m_sessionState->Frame == nullptr);
@@ -597,7 +605,7 @@ namespace Babylon
                     {
                         Napi::Error::New(m_env, result.error()).ThrowAsJavaScriptException();
                     }
-                }).then(m_sessionState->GraphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](const arcana::expected<void, std::exception_ptr>&) {
+                }).then(m_sessionState->GraphicsContext.AfterRenderScheduler(), arcana::cancellation::none(), [this, thisRef{shared_from_this()}](const arcana::expected<void, std::exception_ptr>&) {
                     EndFrame();
                 });
             });
@@ -628,7 +636,7 @@ namespace Babylon
 
                         m_sessionState->TextureToViewConfigurationMap.erase(texturePointer);
                     }
-                }).then(m_sessionState->GraphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(), []{}); // Ensure continuations run on the render thread if they use inline_scheduler.
+                }).then(m_sessionState->GraphicsContext.AfterRenderScheduler(), arcana::cancellation::none(), []{}); // Ensure continuations run on the render thread if they use inline_scheduler.
             });
 
             // Ending a session outside of calls to EndSessionAsync() is currently not supported.
@@ -676,15 +684,15 @@ namespace Babylon
                     // And size is used for determining viewport when rendering to texture.
                     auto colorTextureFormat = XrTextureFormatToBgfxFormat(view.ColorTextureFormat);
                     auto colorTexture = bgfx::createTexture2D(textureWidth, textureHeight, false, textureLayers, colorTextureFormat, BGFX_TEXTURE_RT);
-                    m_sessionState->GraphicsImpl.AddTexture(colorTexture, textureWidth, textureHeight, false, textureLayers, colorTextureFormat);
+                    m_sessionState->GraphicsContext.AddTexture(colorTexture, textureWidth, textureHeight, false, textureLayers, colorTextureFormat);
 
                     auto depthTextureFormat = XrTextureFormatToBgfxFormat(view.DepthTextureFormat);
                     auto depthTexture = bgfx::createTexture2D(textureWidth, textureHeight, false, textureLayers, depthTextureFormat, BGFX_TEXTURE_RT);
-                    m_sessionState->GraphicsImpl.AddTexture(depthTexture, textureWidth, textureHeight, false, textureLayers, depthTextureFormat);
+                    m_sessionState->GraphicsContext.AddTexture(depthTexture, textureWidth, textureHeight, false, textureLayers, depthTextureFormat);
 
                     auto requiresAppClear = view.RequiresAppClear;
 
-                    arcana::make_task(m_sessionState->GraphicsImpl.AfterRenderScheduler(), arcana::cancellation::none(), [colorTexture, depthTexture, &viewConfig]() {
+                    arcana::make_task(m_sessionState->GraphicsContext.AfterRenderScheduler(), arcana::cancellation::none(), [colorTexture, depthTexture, &viewConfig]() {
                         bgfx::overrideInternal(colorTexture, reinterpret_cast<uintptr_t>(viewConfig.ColorTexturePointer));
                         bgfx::overrideInternal(depthTexture, reinterpret_cast<uintptr_t>(viewConfig.DepthTexturePointer));
                     }).then(m_runtimeScheduler, m_sessionState->CancellationSource, [this, thisRef{shared_from_this()}, colorTexture, depthTexture, requiresAppClear, &viewConfig]() {
@@ -699,8 +707,8 @@ namespace Babylon
                             
                             auto frameBufferHandle = bgfx::createFrameBuffer(static_cast<uint8_t>(attachments.size()), attachments.data(), false);
 
-                            const auto frameBufferPtr = new FrameBuffer(
-                                m_sessionState->GraphicsImpl,
+                            const auto frameBufferPtr = new Graphics::FrameBuffer(
+                                m_sessionState->GraphicsContext,
                                 frameBufferHandle,
                                 static_cast<uint16_t>(viewConfig.ViewTextureSize.Width),
                                 static_cast<uint16_t>(viewConfig.ViewTextureSize.Height),
@@ -718,7 +726,7 @@ namespace Babylon
 
                             auto jsWidth{Napi::Value::From(m_env, viewConfig.ViewTextureSize.Width)};
                             auto jsHeight{Napi::Value::From(m_env, viewConfig.ViewTextureSize.Height)};
-                            auto jsFrameBuffer{Napi::Pointer<FrameBuffer>::Create(m_env, frameBufferPtr, Napi::NapiPointerDeleter(frameBufferPtr))};
+                            auto jsFrameBuffer{Napi::Pointer<Graphics::FrameBuffer>::Create(m_env, frameBufferPtr, Napi::NapiPointerDeleter(frameBufferPtr))};
                             viewConfig.JsTextures[frameBufferPtr] = Napi::Persistent(m_sessionState->CreateRenderTexture.Call({jsWidth, jsHeight, jsFrameBuffer}).As<Napi::Object>());
                             // OpenXR doesn't pre-clear textures, and so we need to make sure the render target gets cleared before rendering the scene.
                             // ARCore and ARKit effectively pre-clear by pre-compositing the camera feed.
@@ -788,6 +796,13 @@ namespace Babylon
             static constexpr auto POINT{"point"};
             static constexpr auto PLANE{"plane"};
             static constexpr auto MESH{"mesh"};
+        };
+
+        struct XRImageTrackingState
+        {
+            //static constexpr auto UNTRACKED{"untracked"};
+            static constexpr auto TRACKED{"tracked"};
+            static constexpr auto EMULATED{"emulated"};
         };
 
         struct XREye
@@ -950,9 +965,9 @@ namespace Babylon
                 env.Global().Set(JS_CLASS_NAME, func);
             }
 
-            static Napi::Object New(const Napi::CallbackInfo& info)
+            static Napi::Object New(const Napi::Env& env)
             {
-                return info.Env().Global().Get(JS_CLASS_NAME).As<Napi::Function>().New({});
+                return env.Global().Get(JS_CLASS_NAME).As<Napi::Function>().New({});
             }
 
             XRRigidTransform(const Napi::CallbackInfo& info)
@@ -1089,7 +1104,7 @@ namespace Babylon
                 , m_eyeIdx{0}
                 , m_eye{XREye::IndexToEye(m_eyeIdx)}
                 , m_projectionMatrix{Napi::Persistent(Napi::Float32Array::New(info.Env(), MATRIX_SIZE))}
-                , m_rigidTransform{Napi::Persistent(XRRigidTransform::New(info))}
+                , m_rigidTransform{Napi::Persistent(XRRigidTransform::New(info.Env()))}
                 , m_isFirstPersonObserver{false}
             {
             }
@@ -1111,7 +1126,7 @@ namespace Babylon
 
         private:
             size_t m_eyeIdx{};
-            gsl::czstring<> m_eye{};
+            gsl::czstring m_eye{};
             Napi::Reference<Napi::Float32Array> m_projectionMatrix{};
             Napi::ObjectReference m_rigidTransform{};
             bool m_isFirstPersonObserver{};
@@ -1165,7 +1180,7 @@ namespace Babylon
 
             XRViewerPose(const Napi::CallbackInfo& info)
                 : Napi::ObjectWrap<XRViewerPose>{info}
-                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info))}
+                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info.Env()))}
                 , m_jsViews{Napi::Persistent(Napi::Array::New(info.Env(), 0))}
                 , m_transform{*XRRigidTransform::Unwrap(m_jsTransform.Value())}
                 , m_isEmulatedPosition{true}
@@ -1269,7 +1284,7 @@ namespace Babylon
 
             XRPose(const Napi::CallbackInfo& info)
                 : Napi::ObjectWrap<XRPose>{info}
-                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info))}
+                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info.Env()))}
                 , m_transform{*XRRigidTransform::Unwrap(m_jsTransform.Value())}
             {
             }
@@ -2092,6 +2107,7 @@ namespace Babylon
                         InstanceMethod("getJointPose", &XRFrame::GetJointPose),
                         InstanceMethod("fillPoses", &XRFrame::FillPoses),
                         InstanceMethod("fillJointRadii", &XRFrame::FillJointRadii),
+                        InstanceMethod("getImageTrackingResults", &XRFrame::GetImageTrackingResults),
                         InstanceAccessor("trackedAnchors", &XRFrame::GetTrackedAnchors, nullptr),
                         InstanceAccessor("worldInformation", &XRFrame::GetWorldInformation, nullptr),
                         InstanceAccessor("featurePointCloud", &XRFrame::GetFeaturePointCloud, nullptr),
@@ -2112,11 +2128,13 @@ namespace Babylon
                 : Napi::ObjectWrap<XRFrame>{info}
                 , m_jsXRViewerPose{Napi::Persistent(XRViewerPose::New(info))}
                 , m_xrViewerPose{*XRViewerPose::Unwrap(m_jsXRViewerPose.Value())}
-                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info))}
+                , m_imageTrackingResultsArray{Napi::Persistent(Napi::Array::New(info.Env()))}
+                , m_jsTransform{Napi::Persistent(XRRigidTransform::New(info.Env()))}
                 , m_transform{*XRRigidTransform::Unwrap(m_jsTransform.Value())}
                 , m_jsPose{Napi::Persistent(Napi::Object::New(info.Env()))}
                 , m_jsJointPose{Napi::Persistent(Napi::Object::New(info.Env()))}
             {
+                info.This().As<Napi::Object>().Set("_imageTrackingResults", m_imageTrackingResultsArray.Value());
                 m_jsPose.Set("transform", m_jsTransform.Value());
                 m_jsJointPose.Set("transform", m_jsTransform.Value());
             }
@@ -2138,6 +2156,9 @@ namespace Babylon
 
                 // Update meshes.
                 UpdateMeshes(env, timestamp);
+
+                // Update image tracking results.
+                UpdateImageTrackingResults(env);
             }
 
             Napi::Promise CreateNativeAnchor(const Napi::CallbackInfo& info, xr::Pose pose, xr::NativeTrackablePtr nativeTrackable)
@@ -2213,6 +2234,8 @@ namespace Babylon
             std::vector<Napi::ObjectReference> m_trackedAnchors{};
             std::unordered_map<xr::System::Session::Frame::Plane::Identifier, Napi::ObjectReference> m_trackedPlanes{};
             std::unordered_map<xr::System::Session::Frame::Mesh::Identifier, Napi::ObjectReference> m_trackedMeshes{};
+            std::unordered_map<xr::System::Session::Frame::ImageTrackingResult::Identifier, Napi::ObjectReference> m_trackedImageIDToResultMap{};
+            Napi::Reference<Napi::Array> m_imageTrackingResultsArray{};
             Napi::ObjectReference m_meshSet{};
             std::unordered_map<xr::System::Session::Frame::SceneObject::Identifier, Napi::ObjectReference> m_sceneObjects{};
 
@@ -2295,11 +2318,11 @@ namespace Babylon
                 return Napi::Value::From(info.Env(), true);
             }
 
-            Napi::Value FillJointRadii(const Napi::CallbackInfo& info) 
+            Napi::Value FillJointRadii(const Napi::CallbackInfo& info)
             {
                 const auto spaces = info[0].As<Napi::Array>();
                 auto radii = info[1].As<Napi::Float32Array>();
-                if (spaces.Length() != radii.ElementLength()) 
+                if (spaces.Length() != radii.ElementLength())
                 {
                     throw std::runtime_error{"Number of spaces doesn't match number of radii."};
                 }
@@ -2312,6 +2335,13 @@ namespace Babylon
                 }
 
                 return Napi::Value::From(info.Env(), true);
+            }
+
+            // NativeXRFrame on the JS side expects getImageTrackingResults to be defined at XR initialization time.
+            // This dummy implementation is a placeholder until WebXR Image Tracking support is completed: https://github.com/BabylonJS/BabylonNative/issues/619
+            Napi::Value GetImageTrackingResults (const Napi::CallbackInfo& info)
+            {
+                return info.Env().Undefined();
             }
 
             Napi::Value GetHitTestResults(const Napi::CallbackInfo& info)
@@ -2529,6 +2559,51 @@ namespace Babylon
                     m_meshSet.Value().Get("add").As<Napi::Function>().Call(m_meshSet.Value(), {meshNapiValue.Value()});
                 }
             }
+
+            void UpdateImageTrackingResults(const Napi::Env& env)
+            {
+                // Loop over the list of updated image tracking results, check if they exist in our map if not create them otherwise update them.
+                for (auto imageTrackingResultID : m_frame->UpdatedImageTrackingResults)
+                {
+                    const auto trackedImageTrackingResultIterator{m_trackedImageIDToResultMap.find(imageTrackingResultID)};
+
+                    // Get the matching native result
+                    xr::System::Session::Frame::ImageTrackingResult& nativeResult{m_frame->GetImageTrackingResultByID(imageTrackingResultID)};
+
+                    // Convert the image tracking state from the native result to a string.
+                    const std::string trackingStateString = nativeResult.TrackingState == xr::ImageTrackingState::TRACKED ?
+                        XRImageTrackingState::TRACKED :
+                        XRImageTrackingState::EMULATED;
+
+                    // Result does not yet exist, create the JS object and insert it into the map.
+                    if (trackedImageTrackingResultIterator == m_trackedImageIDToResultMap.end())
+                    {
+                        // Don't add untracked images.
+                        if (nativeResult.TrackingState == xr::ImageTrackingState::UNTRACKED)
+                        {
+                            continue;
+                        }
+
+                        auto napiResult{Napi::Object::New(env)};
+                        napiResult.Set("index", Napi::Value::From(env, nativeResult.Index));
+                        napiResult.Set("trackingState", Napi::Value::From(env, trackingStateString));
+                        napiResult.Set("measuredWidthInMeters", Napi::Value::From(env, nativeResult.MeasuredWidthInMeters));
+                        napiResult.Set("imageSpace", Napi::External<xr::Space>::New(env, &nativeResult.ImageSpace));
+
+                        auto napiResultRef{Napi::Weak(napiResult)};
+                        auto imageTrackingArray{m_imageTrackingResultsArray.Value()};
+                        imageTrackingArray.Set(imageTrackingArray.Length(), napiResultRef.Value());
+                        m_trackedImageIDToResultMap.insert({imageTrackingResultID, std::move(napiResultRef)});
+                    }
+                    else
+                    {
+                        // Update the tracked image.
+                        auto napiResult{trackedImageTrackingResultIterator->second.Value().As<Napi::Object>()};
+                        napiResult.Set("trackingState", Napi::Value::From(env, trackingStateString));
+                        napiResult.Set("measuredWidthInMeters", Napi::Value::From(env, nativeResult.MeasuredWidthInMeters));
+                    }
+                }
+            }
         };
 
         // Creates an anchor from a hit result.
@@ -2573,6 +2648,11 @@ namespace Babylon
             static constexpr auto JS_EVENT_NAME_SQUEEZE_END = "squeezeend";
             static constexpr auto JS_EVENT_NAME_EYE_TRACKING_START = "eyetrackingstart";
             static constexpr auto JS_EVENT_NAME_EYE_TRACKING_END = "eyetrackingend";
+            struct XRImageTrackingScore
+            {
+                static constexpr auto UNTRACKABLE{"untrackable"};
+                static constexpr auto TRACKABLE{"trackable"};
+            };
 
         public:
             static void Initialize(Napi::Env env)
@@ -2594,6 +2674,7 @@ namespace Babylon
                         InstanceMethod("trySetPreferredPlaneDetectorOptions", &XRSession::TrySetPreferredPlaneDetectorOptions),
                         InstanceMethod("trySetMeshDetectorEnabled", &XRSession::TrySetMeshDetectorEnabled),
                         InstanceMethod("trySetPreferredMeshDetectorOptions", &XRSession::TrySetPreferredMeshDetectorOptions),
+                        InstanceMethod("getTrackedImageScores", &XRSession::GetTrackedImageScores),
                     });
 
                 env.Global().Set(JS_CLASS_NAME, func);
@@ -2604,6 +2685,39 @@ namespace Babylon
                 auto jsSession{Napi::Persistent(info.Env().Global().Get(JS_CLASS_NAME).As<Napi::Function>().New({info[0]}))};
                 auto& session{*XRSession::Unwrap(jsSession.Value())};
                 session.m_xr = std::move(nativeXr);
+
+                auto featureObject = info[1].As<Napi::Object>();
+                if (featureObject.Has("trackedImages"))
+                {
+                    const auto napiTrackedImages{featureObject.Get("trackedImages").As<Napi::Array>()};
+                    session.m_imageTrackingRequests.resize(napiTrackedImages.Length());
+
+                    // Create the tracked image buffer.
+                    for (uint32_t idx = 0; idx < napiTrackedImages.Length(); idx++)
+                    {
+                        // Pull out native values from the JS object.
+                        const auto napiImageRequest{napiTrackedImages.Get(idx).As<Napi::Object>()};
+                        const auto napiImage{napiImageRequest.Get("image").As<Napi::Object>()};
+                        const auto napiBuffer{napiImage.Get("data").As<Napi::Uint8Array>()};
+                        const uint32_t bufferSize{(uint32_t) napiBuffer.ByteLength()};
+                        const uint32_t imageHeight{napiImage.Get("height").ToNumber().Uint32Value()};
+                        const uint32_t imageWidth{napiImage.Get("width").ToNumber().Uint32Value()};
+                        const uint32_t imageDepth{napiImage.Get("depth").ToNumber().Uint32Value()};
+                        const uint32_t stride{bufferSize / imageHeight};
+                        const float estimatedWidth{napiImageRequest.Get("widthInMeters").ToNumber().FloatValue()};
+
+                        // Construct the image tracking request object.
+                        session.m_imageTrackingRequests[idx] =
+                        {
+                            napiBuffer.Data(),
+                            imageWidth,
+                            imageHeight,
+                            imageDepth,
+                            stride,
+                            estimatedWidth
+                        };
+                    }
+                }
 
                 auto deferred{Napi::Promise::Deferred::New(info.Env())};
                 session.m_xr->BeginSessionAsync()
@@ -2618,7 +2732,6 @@ namespace Babylon
                                 deferred.Resolve(jsSession.Value());
                             }
                         });
-
                 return deferred.Promise();
             }
 
@@ -2691,6 +2804,8 @@ namespace Babylon
             std::vector<xr::System::Session::Frame::InputSource::Identifier> m_activeSelects{};
             std::vector<xr::System::Session::Frame::InputSource::Identifier> m_activeSqueezes{};
 
+            std::vector<xr::System::Session::ImageTrackingRequest> m_imageTrackingRequests{};
+
             Napi::Value GetInputSources(const Napi::CallbackInfo& /*info*/)
             {
                 return m_jsInputSources.Value();
@@ -2737,7 +2852,7 @@ namespace Babylon
                 deferred.Resolve(info.Env().Undefined());
                 return deferred.Promise();
             }
-                
+
             void ProcessEyeInputSource(const xr::System::Session::Frame& frame, Napi::Env env)
             {
                 if (frame.EyeTrackerSpace.has_value() && m_jsEyeTrackedSource.IsEmpty())
@@ -2825,7 +2940,7 @@ namespace Babylon
                     const bool isSqueezed = inputSource.GamepadObject.Buttons[1].Pressed;
                     const bool wasSelected = std::find(m_activeSelects.begin(), m_activeSelects.end(), inputSource.ID) != m_activeSelects.end();
                     const bool wasSqueezed = std::find(m_activeSqueezes.begin(), m_activeSqueezes.end(), inputSource.ID) != m_activeSqueezes.end();
-                    
+
                     if (isSelected && !wasSelected)
                     {
                         selectStarts.push_back(inputSource.ID);
@@ -2925,6 +3040,14 @@ namespace Babylon
                     ProcessControllerInputSources(frame, Env());
 
                     m_xrFrame.Update(Env(), frame, m_timestamp);
+
+                    if (m_imageTrackingRequests.size() > 0) {
+                        // Kick off creation of the augmented image database.
+                        m_xr->CreateAugmentedImageDatabase(m_imageTrackingRequests);
+
+                        // Clean up image tracking requests
+                        m_imageTrackingRequests.clear();
+                    }
 
                     callbackPtr->Value().Call({Napi::Value::From(Env(), m_timestamp), m_jsXRFrame.Value()});
                 });
@@ -3107,6 +3230,28 @@ namespace Babylon
                 const auto options = CreateDetectorOptions(info[0].As<Napi::Object>());
                 const auto result = m_xr->TrySetPreferredMeshDetectorOptions(options);
                 return Napi::Value::From(info.Env(), result);
+            }
+
+            Napi::Value GetTrackedImageScores(const Napi::CallbackInfo& info)
+            {
+                std::vector<xr::ImageTrackingScore>* imageTrackingScores{m_xr->GetImageTrackingScores()};
+                if (imageTrackingScores == nullptr) {
+                    return info.Env().Undefined();
+                }
+
+                auto results{Napi::Array::New(info.Env(), imageTrackingScores->size())};
+                uint32_t index{0};
+
+                // Loop over the list of tracked image tracking results, and add them to the array.
+                for (const auto& score : *imageTrackingScores)
+                {
+                    const std::string scoreString = score == xr::ImageTrackingScore::TRACKABLE ?
+                        XRImageTrackingScore::TRACKABLE :
+                        XRImageTrackingScore::UNTRACKABLE;
+                    results.Set(index++, Napi::Value::From(info.Env(), scoreString));
+                }
+
+                return std::move(results);
             }
         };
 

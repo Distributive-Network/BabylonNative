@@ -1,4 +1,5 @@
 set(SOURCES
+    "Include/Babylon/Dispatchable.h"
     "Include/Babylon/AppRuntime.h"
     "Source/AppRuntime.cpp"
     "Source/AppRuntime_${NAPI_JAVASCRIPT_ENGINE}.cpp"
@@ -15,6 +16,10 @@ target_include_directories(AppRuntime
 
 if(UNIX AND NOT APPLE AND NOT ANDROID)
     target_include_directories(AppRuntime INTERFACE "/usr/include/webkitgtk-4.0/")
+endif()
+
+if(APPLE)
+    set_property(TARGET AppRuntime PROPERTY UNITY_BUILD false)
 endif()
 
 target_link_to_dependencies(AppRuntime

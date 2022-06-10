@@ -1,7 +1,8 @@
+#pragma once
 #include <napi/napi.h>
 #include "NativeCameraImpl.h"
 #include <Babylon/JsRuntime.h>
-#include <GraphicsImpl.h>
+#include <Babylon/Graphics/DeviceContext.h>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>

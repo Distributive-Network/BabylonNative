@@ -89,6 +89,7 @@ std::unique_ptr<Babylon::Polyfills::Canvas> nativeCanvas{};
     graphicsConfig.Window = engineView;
     graphicsConfig.Width = width;
     graphicsConfig.Height = height;
+    graphicsConfig.MSAASamples = 4;
     device = Babylon::Graphics::Device::Create(graphicsConfig);
     update = std::make_unique<Babylon::Graphics::DeviceUpdate>(device->GetUpdate("update"));
 
@@ -246,7 +247,7 @@ std::unique_ptr<Babylon::Polyfills::Canvas> nativeCanvas{};
 - (void)scrollWheel:(NSEvent *) theEvent {
     if (nativeInput)
     {
-        nativeInput->MouseWheel(Babylon::Plugins::NativeInput::MOUSEWHEEL_Y_ID, theEvent.deltaY);
+        nativeInput->MouseWheel(Babylon::Plugins::NativeInput::MOUSEWHEEL_Y_ID, -theEvent.deltaY);
     }
 }
 

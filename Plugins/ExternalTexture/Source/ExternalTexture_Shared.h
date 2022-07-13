@@ -27,7 +27,7 @@ namespace Babylon::Plugins
         return m_impl->Height();
     }
 
-    Napi::Promise ExternalTexture::AddToContextAsync(Napi::Env& env) const
+    Napi::Promise ExternalTexture::AddToContextAsync(Napi::Env env) const
     {
         Graphics::DeviceContext& context = Graphics::DeviceContext::GetFromJavaScript(env);
         JsRuntime& runtime = JsRuntime::GetFromJavaScript(env);
@@ -68,9 +68,10 @@ namespace Babylon::Plugins
 
                 runtime.Dispatch([deferred = std::move(deferred), handle, impl = std::move(impl)](Napi::Env env)
                 {
-                    auto* texture = new Graphics::TextureData{handle, true, impl->Width(), impl->Height()};
+                    auto* texture = new Graphics::Texture{};
+                    texture->Attach(handle, true, impl->Width(), impl->Height());
 
-                    auto jsObject = Napi::Pointer<Graphics::TextureData>::Create(env, texture, [texture] {
+                    auto jsObject = Napi::Pointer<Graphics::Texture>::Create(env, texture, [texture] {
                         delete texture;
                     });
 

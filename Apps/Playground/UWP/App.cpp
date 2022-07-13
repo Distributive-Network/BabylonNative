@@ -308,7 +308,7 @@ void App::OnPointerReleased(CoreWindow^, PointerEventArgs^ args)
 void App::OnPointerWheelChanged(CoreWindow^, PointerEventArgs^ args)
 {
     const auto delta = args->CurrentPoint->Properties->MouseWheelDelta;
-    m_nativeInput->MouseWheel(Babylon::Plugins::NativeInput::MOUSEWHEEL_Y_ID, delta);
+    m_nativeInput->MouseWheel(Babylon::Plugins::NativeInput::MOUSEWHEEL_Y_ID, -delta);
 }
 
 void App::OnKeyPressed(CoreWindow^ window, KeyEventArgs^ args)
@@ -354,6 +354,7 @@ void App::RestartRuntime(Windows::Foundation::Rect bounds)
     graphicsConfig.Window = window;
     graphicsConfig.Width = width;
     graphicsConfig.Height = height;
+    graphicsConfig.MSAASamples = 4;
     m_device = Babylon::Graphics::Device::Create(graphicsConfig);
     m_update = std::make_unique<Babylon::Graphics::DeviceUpdate>(m_device->GetUpdate("update"));
     m_device->StartRenderingCurrentFrame();

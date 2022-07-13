@@ -20,9 +20,10 @@ namespace Babylon::Graphics
     {
     public:
         DeviceUpdate(const DeviceUpdate&) = default;
-        DeviceUpdate(DeviceUpdate&&) = default;
         DeviceUpdate& operator=(const DeviceUpdate&) = default;
-        DeviceUpdate& operator=(DeviceUpdate&&) = default;
+
+        DeviceUpdate(DeviceUpdate&&) noexcept = default;
+        DeviceUpdate& operator=(DeviceUpdate&&) noexcept = default;
 
         void Start()
         {
@@ -74,6 +75,7 @@ namespace Babylon::Graphics
 
         void UpdateWindow(const WindowConfiguration& config);
         void UpdateSize(size_t width, size_t height);
+        void UpdateMSAA(uint8_t value);
 
         void AddToJavaScript(Napi::Env);
         Napi::Value CreateContext(Napi::Env);

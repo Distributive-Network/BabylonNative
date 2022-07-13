@@ -14,9 +14,12 @@ namespace Babylon
         VertexBuffer(gsl::span<uint8_t> bytes, bool dynamic);
         ~VertexBuffer();
 
+        VertexBuffer(const VertexBuffer&) = delete;
+        VertexBuffer& operator=(const VertexBuffer&) = delete;
+
         void Dispose();
 
-        void Update(Napi::Env env, gsl::span<uint8_t> bytes);
+        void Update(Napi::Env env, gsl::span<uint8_t> bytes, size_t byteOffset);
         bool CreateHandle(const bgfx::VertexLayout& layout);
         void PromoteToFloats(bgfx::AttribType::Enum attribType, uint32_t numElements, uint32_t byteOffset, uint32_t byteStride);
         void Set(bgfx::Encoder* encoder, uint8_t stream, uint32_t startVertex, uint32_t numVertices, bgfx::VertexLayoutHandle layoutHandle);
@@ -28,7 +31,9 @@ namespace Babylon
             uint32_t Stride{};
             uint32_t ElementSize{};
         };
+
         static void BuildInstanceDataBuffer(bgfx::InstanceDataBuffer& instanceDataBuffer, const std::map<bgfx::Attrib::Enum, InstanceVertexBufferRecord>& vertexBufferInstance);
+
     private:
         std::optional<std::vector<uint8_t>> m_bytes{};
         bool m_dynamic{};

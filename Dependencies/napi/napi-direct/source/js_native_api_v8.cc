@@ -674,6 +674,11 @@ const char* error_messages[] = {nullptr,
                                 "A detachable arraybuffer was expected",
 };
 
+NAPI_NO_RETURN void napi_fatal_error(const char* location,
+                                     size_t location_len,
+                                     const char* message,
+                                     size_t message_len) {}
+
 NAPI_EXTERN void napi_module_register(napi_module* mod) {}
 
 napi_status napi_get_last_error_info(napi_env env,

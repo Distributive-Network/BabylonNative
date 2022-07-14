@@ -48,10 +48,15 @@ typedef struct {
   void* reserved[4];
 } napi_module;
 
-NAPI_EXTERN napi_status napi_detach_arraybuffer(napi_env env,
-                                                napi_value arraybuffer);
+NAPI_NO_RETURN void napi_fatal_error(const char* location,
+                                     size_t location_len,
+                                     const char* message,
+                                     size_t message_len);
 
 NAPI_EXTERN void napi_module_register(napi_module* mod);
+
+NAPI_EXTERN napi_status napi_detach_arraybuffer(napi_env env,
+                                                napi_value arraybuffer);
 
 NAPI_EXTERN napi_status
 napi_get_last_error_info(napi_env env,

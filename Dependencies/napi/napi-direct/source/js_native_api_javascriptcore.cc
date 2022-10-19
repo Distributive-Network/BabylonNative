@@ -2364,30 +2364,6 @@ napi_status napi_run_script(napi_env env,
   return napi_ok;
 }
 
-napi_status napi_run_script(napi_env env,
-                            napi_value script,
-                            const char* source_url,
-                            napi_value* result) {
-  CHECK_ENV(env);
-  CHECK_ARG(env, script);
-  CHECK_ARG(env, result);
-
-  JSValueRef exception{};
-
-  JSString script_str{ToJSString(env, script, &exception)};
-  CHECK_JSC(env, exception);
-
-  JSValueRef return_value{JSEvaluateScript(
-    env->context, script_str, nullptr, JSString(source_url), 0, &exception)};
-  CHECK_JSC(env, exception);
-
-  if (result != nullptr) {
-    *result = ToNapi(return_value);
-  }
-
-  return napi_ok;
-}
-
 napi_status napi_add_finalizer(napi_env env,
                                napi_value js_object,
                                void* native_object,

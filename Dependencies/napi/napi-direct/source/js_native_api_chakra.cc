@@ -2384,23 +2384,6 @@ napi_status napi_run_script(napi_env env,
   return napi_ok;
 }
 
-napi_status napi_run_script(napi_env env,
-                            napi_value script,
-                            const char* source_url,
-                            napi_value* result) {
-  CHECK_ENV(env);
-  CHECK_ARG(env, script);
-  CHECK_ARG(env, result);
-  JsValueRef scriptVar = reinterpret_cast<JsValueRef>(script);
-
-  const wchar_t* scriptStr;
-  size_t scriptStrLen;
-  CHECK_JSRT(env, JsStringToPointer(scriptVar, &scriptStr, &scriptStrLen));
-  CHECK_JSRT_EXPECTED(env, JsRunScript(scriptStr, ++env->source_context, NarrowToWide({ source_url }).data(), reinterpret_cast<JsValueRef*>(result)), napi_string_expected);
-
-  return napi_ok;
-}
-
 napi_status napi_add_finalizer(napi_env env,
                                napi_value js_object,
                                void* native_object,

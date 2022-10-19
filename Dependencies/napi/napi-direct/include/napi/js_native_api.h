@@ -23,7 +23,6 @@
   #else
     #define NAPI_EXTERN /* nothing */
   #endif
-  #define NAPI_NO_RETURN
 #endif
 
 #define NAPI_AUTO_LENGTH SIZE_MAX
@@ -37,26 +36,6 @@
 #endif
 
 EXTERN_C_START
-
-typedef struct {
-  int nm_version;
-  unsigned int nm_flags;
-  const char* nm_filename;
-  void* nm_register_func;
-  const char* nm_modname;
-  void* nm_priv;
-  void* reserved[4];
-} napi_module;
-
-NAPI_NO_RETURN void napi_fatal_error(const char* location,
-                                     size_t location_len,
-                                     const char* message,
-                                     size_t message_len);
-
-NAPI_EXTERN void napi_module_register(napi_module* mod);
-
-NAPI_EXTERN napi_status napi_detach_arraybuffer(napi_env env,
-                                                napi_value arraybuffer);
 
 NAPI_EXTERN napi_status
 napi_get_last_error_info(napi_env env,
@@ -460,7 +439,6 @@ NAPI_EXTERN napi_status napi_is_promise(napi_env env,
 // Running a script
 NAPI_EXTERN napi_status napi_run_script(napi_env env,
                                         napi_value script,
-                                        const char* source_url,
                                         napi_value* result);
 
 // Memory management

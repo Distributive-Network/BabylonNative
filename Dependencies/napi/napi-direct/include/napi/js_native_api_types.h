@@ -25,7 +25,8 @@ typedef enum {
   napi_default = 0,
   napi_writable = 1 << 0,
   napi_enumerable = 1 << 1,
-  napi_configurable = 1 << 2,  
+  napi_configurable = 1 << 2,
+
   // Used with napi_define_class to distinguish static properties
   // from instance properties. Ignored by napi_define_properties.
   napi_static = 1 << 10,

@@ -1,10 +1,11 @@
 #include <climits>  // INT_MAX
 #include <cmath>
 #include <algorithm>
-#include <sstream>
 #define NAPI_EXPERIMENTAL
+#include "env-inl.h"
 #include "js_native_api_v8.h"
-#include <napi/js_native_api.h>
+#include "js_native_api.h"
+#include "util-inl.h"
 
 #define CHECK_MAYBE_NOTHING(env, maybe, status) \
   RETURN_STATUS_IF_FALSE((env), !((maybe).IsNothing()), (status))
@@ -51,10 +52,6 @@
         "Invalid typed array length");                                         \
     (out) = v8::type::New((buffer), (byte_offset), (length));                  \
   } while (0)
-
-#ifndef __clang__
-#pragma warning(disable: 4100 4267)
-#endif
 
 namespace v8impl {
 
@@ -360,7 +357,8 @@ inline static napi_status Unwrap(napi_env env,
   RETURN_STATUS_IF_FALSE(env, value->IsObject(), napi_invalid_arg);
   v8::Local<v8::Object> obj = value.As<v8::Object>();
 
-  auto val = obj->GetInternalField(0);
+  auto val = obj->GetPrivate(context, NAPI_PRIVATE_KEY(context, wrapper))
+      .ToLocalChecked();
   RETURN_STATUS_IF_FALSE(env, val->IsExternal(), napi_invalid_arg);
   Reference* reference =
       static_cast<v8impl::Reference*>(val.As<v8::External>()->Value());
@@ -370,7 +368,8 @@ inline static napi_status Unwrap(napi_env env,
   }
 
   if (action == RemoveWrap) {
-    obj->SetInternalField(0, v8::Undefined(env->isolate));
+    CHECK(obj->DeletePrivate(context, NAPI_PRIVATE_KEY(context, wrapper))
+        .FromJust());
     Reference::Delete(reference);
   }
 
@@ -615,7 +614,8 @@ inline napi_status Wrap(napi_env env,
   if (wrap_type == retrievable) {
     // If we've already wrapped this object, we error out.
     RETURN_STATUS_IF_FALSE(env,
-        obj->GetInternalField(0)->IsUndefined(),
+        !obj->HasPrivate(context, NAPI_PRIVATE_KEY(context, wrapper))
+            .FromJust(),
         napi_invalid_arg);
   } else if (wrap_type == anonymous) {
     // If no finalize callback is provided, we error out.
@@ -639,7 +639,8 @@ inline napi_status Wrap(napi_env env,
   }
 
   if (wrap_type == retrievable) {
-    obj->SetInternalField(0, v8::External::New(env->isolate, reference));
+    CHECK(obj->SetPrivate(context, NAPI_PRIVATE_KEY(context, wrapper),
+          v8::External::New(env->isolate, reference)).FromJust());
   }
 
   return GET_RETURN_STATUS(env);
@@ -673,13 +674,6 @@ const char* error_messages[] = {nullptr,
                                 "An arraybuffer was expected",
                                 "A detachable arraybuffer was expected",
 };
-
-NAPI_NO_RETURN void napi_fatal_error(const char* location,
-                                     size_t location_len,
-                                     const char* message,
-                                     size_t message_len) {}
-
-NAPI_EXTERN void napi_module_register(napi_module* mod) {}
 
 napi_status napi_get_last_error_info(napi_env env,
                                      const napi_extended_error_info** result) {
@@ -770,8 +764,6 @@ napi_status napi_define_class(napi_env env,
 
   v8::Local<v8::FunctionTemplate> tpl = v8::FunctionTemplate::New(
       isolate, v8impl::FunctionCallbackWrapper::Invoke, cbdata);
-
-  tpl->InstanceTemplate()->SetInternalFieldCount(1);
 
   v8::Local<v8::String> name_string;
   CHECK_NEW_FROM_UTF8_LEN(env, name_string, utf8name, length);
@@ -2955,32 +2947,14 @@ napi_status napi_run_script(napi_env env,
 
   auto maybe_script = v8::Script::Compile(context,
       v8::Local<v8::String>::Cast(v8_script));
+  CHECK_MAYBE_EMPTY(env, maybe_script, napi_generic_failure);
 
-  if (!maybe_script.IsEmpty()) {
-      auto script_result =
-          maybe_script.ToLocalChecked()->Run(context);
-      if (!script_result.IsEmpty()) {
-          *result = v8impl::JsValueFromV8LocalValue(
-              script_result.ToLocalChecked());
-      }
-  }
+  auto script_result =
+      maybe_script.ToLocalChecked()->Run(context);
+  CHECK_MAYBE_EMPTY(env, script_result, napi_generic_failure);
 
+  *result = v8impl::JsValueFromV8LocalValue(script_result.ToLocalChecked());
   return GET_RETURN_STATUS(env);
-}
-
-napi_status napi_run_script(napi_env env,
-                            napi_value script,
-                            const char* source_url,
-                            napi_value* result) {
-    // Append the source URL so V8 can locate the file.
-    std::ostringstream source_url_comment;
-    source_url_comment << std::endl << "//# sourceURL=" << source_url << std::endl;
-    const auto source_url_comment_str = source_url_comment.str();
-
-    const auto v8_script_string = v8::Local<v8::String>::Cast(v8impl::V8LocalValueFromJsValue(script));
-    const auto source_with_comment = v8::String::Concat(env->isolate, v8_script_string, OneByteString(env->isolate, source_url_comment_str.c_str(), source_url_comment_str.size()));
-
-    return napi_run_script(env, v8impl::JsValueFromV8LocalValue(source_with_comment), result);
 }
 
 napi_status napi_add_finalizer(napi_env env,
@@ -3043,16 +3017,10 @@ napi_status napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
   v8::Local<v8::ArrayBuffer> it = value.As<v8::ArrayBuffer>();
   RETURN_STATUS_IF_FALSE(
       env, it->IsExternal(), napi_detachable_arraybuffer_expected);
-#if V8_MAJOR_VERSION > 7 || (V8_MAJOR_VERSION == 7 && V8_MINOR_VERSION >= 4)
   RETURN_STATUS_IF_FALSE(
       env, it->IsDetachable(), napi_detachable_arraybuffer_expected);
 
   it->Detach();
-#else
-  RETURN_STATUS_IF_FALSE(
-      env, it->IsNeuterable(), napi_detachable_arraybuffer_expected);
 
-  it->Neuter();
-#endif
   return napi_clear_last_error(env);
 }

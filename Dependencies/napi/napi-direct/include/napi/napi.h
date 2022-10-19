@@ -1,16 +1,7 @@
 #ifndef SRC_NAPI_H_
 #define SRC_NAPI_H_
 
-#ifdef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
-#define NAPI_NO_RETURN
-#endif
-
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 #include <node_api.h>
-#else
-#include "js_native_api.h"
-#endif
-
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -796,8 +787,8 @@ namespace Napi {
     ArrayBuffer();                               ///< Creates a new _empty_ ArrayBuffer instance.
     ArrayBuffer(napi_env env, napi_value value); ///< Wraps a N-API value primitive.
 
-    void* Data() const;        ///< Gets a pointer to the data buffer.
-    size_t ByteLength() const; ///< Gets the length of the array buffer in bytes.
+    void* Data();        ///< Gets a pointer to the data buffer.
+    size_t ByteLength(); ///< Gets the length of the array buffer in bytes.
 
   private:
     mutable void* _data;
@@ -1013,10 +1004,8 @@ namespace Napi {
     Value Call(size_t argc, const napi_value* args) const;
     Value Call(napi_value recv, const std::initializer_list<napi_value>& args) const;
     Value Call(napi_value recv, const std::vector<napi_value>& args) const;
-    Value Call(napi_value recv, size_t argc, const Napi::Value* args) const;
     Value Call(napi_value recv, size_t argc, const napi_value* args) const;
 
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
     Value MakeCallback(napi_value recv,
                        const std::initializer_list<napi_value>& args,
                        napi_async_context context = nullptr) const;
@@ -1027,7 +1016,6 @@ namespace Napi {
                        size_t argc,
                        const napi_value* args,
                        napi_async_context context = nullptr) const;
-#endif // NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 
     Object New(const std::initializer_list<napi_value>& args) const;
     Object New(const std::vector<napi_value>& args) const;
@@ -1056,7 +1044,6 @@ namespace Napi {
     Promise(napi_env env, napi_value value);
   };
 
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
   template <typename T>
   class Buffer : public Uint8Array {
   public:
@@ -1089,7 +1076,6 @@ namespace Napi {
     Buffer(napi_env env, napi_value value, size_t length, T* data);
     void EnsureInfo() const;
   };
-#endif // NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 
   /// Holds a counted reference to a value; initially a weak reference unless otherwise specified,
   /// may be changed to/from a strong reference by adjusting the refcount.
@@ -1201,7 +1187,6 @@ namespace Napi {
     Napi::Value Call(napi_value recv, const std::vector<napi_value>& args) const;
     Napi::Value Call(napi_value recv, size_t argc, const napi_value* args) const;
 
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
     Napi::Value MakeCallback(napi_value recv,
                              const std::initializer_list<napi_value>& args,
                              napi_async_context context = nullptr) const;
@@ -1212,7 +1197,6 @@ namespace Napi {
                              size_t argc,
                              const napi_value* args,
                              napi_async_context context = nullptr) const;
-#endif // NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 
     Object New(const std::initializer_list<napi_value>& args) const;
     Object New(const std::vector<napi_value>& args) const;
@@ -1325,11 +1309,6 @@ namespace Napi {
     static Error New(napi_env env);
     static Error New(napi_env env, const char* message);
     static Error New(napi_env env, const std::string& message);
-
-#ifdef NAPI_CPP_EXCEPTIONS
-    static Error New(napi_env env, const std::exception& exception);
-    static Error New(napi_env env, const std::exception_ptr& exception_ptr);
-#endif // NAPI_CPP_EXCEPTIONS
 
     static NAPI_NO_RETURN void Fatal(const char* location, const char* message);
 
@@ -1775,7 +1754,6 @@ namespace Napi {
     napi_escapable_handle_scope _scope;
   };
 
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 #if (NAPI_VERSION > 2)
   class CallbackScope {
   public:
@@ -1877,7 +1855,6 @@ namespace Napi {
     std::string _error;
     bool _suppress_destruct;
   };
-#endif // NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 
   #if (NAPI_VERSION > 3)
   class ThreadSafeFunction {
@@ -2086,7 +2063,6 @@ namespace Napi {
   };
   #endif
 
-#ifndef NODE_ADDON_API_DISABLE_NODE_SPECIFIC
   // Memory management.
   class MemoryManagement {
     public:
@@ -2099,7 +2075,6 @@ namespace Napi {
       static uint32_t GetNapiVersion(Env env);
       static const napi_node_version* GetNodeVersion(Env env);
   };
-#endif // NODE_ADDON_API_DISABLE_NODE_SPECIFIC
 
 } // namespace Napi
 
